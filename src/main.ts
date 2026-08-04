@@ -26,6 +26,7 @@ export default function burnRateExtension(pi: ExtensionAPI): void {
 	let timer: NodeJS.Timeout | undefined;
 
 	pi.on("session_start", (_event, ctx) => {
+		clearInterval(timer);
 		render(ctx);
 		timer = setInterval(() => render(ctx), REFRESH_MS);
 	});
