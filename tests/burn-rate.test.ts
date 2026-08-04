@@ -164,6 +164,14 @@ describe("groupByAccount", () => {
 		expect(first.find((g) => g.key === "account:aaa")?.icon).toBe(pickIcon("account:aaa"));
 	});
 
+	test("guarantees distinct icons for as many accounts as the palette holds (16), even under hash collisions", () => {
+		const manyAccounts = Array.from({ length: 16 }, (_, i) =>
+			row({ provider: "anthropic", accountKey: "oauth", accountId: `account:${i}`, label: "L" }),
+		);
+		const icons = groupByAccount(manyAccounts).map((g) => g.icon);
+		expect(new Set(icons).size).toBe(16);
+	});
+
 	test("falls back to provider+accountKey when accountId and email are both absent", () => {
 		const noId = [row({ provider: "kimi-code", accountKey: "secret:abc", label: "Usage window" })];
 		const groups = groupByAccount(noId);
@@ -201,7 +209,8 @@ describe("pickMostUrgent", () => {
 			],
 		};
 		const pick = pickMostUrgent(group, now);
-		expect(pick?.displayPct).toBeCloseTo(60, 5);
+		expect(pick?.hasProjection).toBe(false);
+		expect(pick?.usedPct).toBeCloseTo(60, 5);
 	});
 
 	test("skips rows with null usedFraction and returns undefined when none remain", () => {
@@ -220,27 +229,31 @@ describe("formatStatusLine", () => {
 		expect(formatStatusLine([])).toBeUndefined();
 	});
 
-	test("renders one segment per distinct account with pct and emoji", () => {
+	test("shows the current used% plus pace delta and ETA when a projection is derivable", () => {
 		const now = 1_000_000;
+		// 10h window, 5h elapsed (50%), 30% used so far → projects to 60% at reset (under pace).
 		const rows: QuotaRow[] = [
 			row({
 				provider: "anthropic",
 				accountKey: "oauth",
 				accountId: "account:aaa",
 				email: "aryrabelo@gmail.com",
-				label: "Claude 5 Hour",
-				usedFraction: 0.95,
-			}),
-			row({
-				provider: "kimi-code",
-				accountKey: "secret:xyz",
-				label: "Usage window",
-				usedFraction: 0.1,
+				label: "Claude 10 Hour",
+				windowLabel: "10 Hour",
+				usedFraction: 0.3,
+				resetsAt: now + 5 * HOUR_MS,
 			}),
 		];
 		const line = formatStatusLine(rows, now);
-		expect(line).toBe(
-			`${pickIcon("account:aaa")}aryrabelo:95%\u{1f7e1} ${pickIcon("kimi-code:secret:xyz")}kimi-code:10%\u{1f7e2}`,
-		);
+		expect(line).toContain("aryrabelo 30%\u{1f7e2}(-40%/5h00m)");
+	});
+
+	test("omits pace delta and ETA when no window length is derivable — shows raw used% only", () => {
+		const now = 1_000_000;
+		const rows: QuotaRow[] = [
+			row({ provider: "kimi-code", accountKey: "secret:xyz", label: "Usage window", usedFraction: 0.1 }),
+		];
+		const line = formatStatusLine(rows, now);
+		expect(line).toBe(`${pickIcon("kimi-code:secret:xyz")}kimi-code 10%`);
 	});
 });
