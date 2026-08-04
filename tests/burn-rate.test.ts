@@ -4,6 +4,7 @@ import {
 	formatStatusLine,
 	groupByAccount,
 	parseWindowMs,
+	pickIcon,
 	pickMostUrgent,
 	projectionLabel,
 } from "../src/burn-rate";
@@ -156,6 +157,13 @@ describe("groupByAccount", () => {
 		expect(groups.find((g) => g.key === "account:aaa")?.shortLabel).toBe("aryrabelo");
 	});
 
+	test("assigns a stable icon per account, deterministic across calls", () => {
+		const first = groupByAccount(rows);
+		const second = groupByAccount(rows);
+		expect(first.map((g) => g.icon)).toEqual(second.map((g) => g.icon));
+		expect(first.find((g) => g.key === "account:aaa")?.icon).toBe(pickIcon("account:aaa"));
+	});
+
 	test("falls back to provider+accountKey when accountId and email are both absent", () => {
 		const noId = [row({ provider: "kimi-code", accountKey: "secret:abc", label: "Usage window" })];
 		const groups = groupByAccount(noId);
@@ -177,6 +185,7 @@ describe("pickMostUrgent", () => {
 		const group = {
 			key: "acct",
 			shortLabel: "acct",
+			icon: pickIcon("acct"),
 			rows: [
 				// Raw 60% used, but window barely started (no projection possible without windowLabel).
 				row({ provider: "anthropic", accountKey: "oauth", label: "A", usedFraction: 0.6 }),
@@ -199,6 +208,7 @@ describe("pickMostUrgent", () => {
 		const group = {
 			key: "acct",
 			shortLabel: "acct",
+			icon: pickIcon("acct"),
 			rows: [row({ provider: "anthropic", accountKey: "oauth", label: "A", usedFraction: null })],
 		};
 		expect(pickMostUrgent(group, Date.now())).toBeUndefined();
@@ -229,6 +239,8 @@ describe("formatStatusLine", () => {
 			}),
 		];
 		const line = formatStatusLine(rows, now);
-		expect(line).toBe("aryrabelo:95%\u{1f7e1} kimi-code:10%\u{1f7e2}");
+		expect(line).toBe(
+			`${pickIcon("account:aaa")}aryrabelo:95%\u{1f7e1} ${pickIcon("kimi-code:secret:xyz")}kimi-code:10%\u{1f7e2}`,
+		);
 	});
 });

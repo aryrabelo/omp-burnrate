@@ -12,6 +12,24 @@ const DAY_MS: number = 24 * HOUR_MS;
 const WEEK_MS: number = 7 * DAY_MS;
 const MONTH_MS: number = 30 * DAY_MS;
 
+/**
+ * Distinct per-account icon, deterministic (same account key always maps to the same icon,
+ * no config file to maintain as accounts get added/removed) — mirrors what the old Claude Code
+ * statusline did with a hardcoded email→icon switch, minus the manual upkeep.
+ */
+const ACCOUNT_ICONS = ["💻", "💼", "🔈", "🚀", "🛰️", "🧪", "🔋", "🛠️", "🌐", "🎯", "📡", "🧭"] as const;
+
+function hashCode(s: string): number {
+	let h = 0;
+	for (let i = 0; i < s.length; i++) h = (h * 31 + s.charCodeAt(i)) | 0;
+	return h >>> 0;
+}
+
+/** Stable icon for an account key (same input → same icon, across runs and processes). */
+export function pickIcon(key: string): string {
+	return ACCOUNT_ICONS[hashCode(key) % ACCOUNT_ICONS.length] as string;
+}
+
 /** Leading-integer-plus-unit parser for free-text window labels ("7 Day", "5 Hour", "Weekly", "Monthly"). */
 const WINDOW_UNIT_RE = /^(\d+)?\s*(hour|hr|h|day|d|week|weekly|month|monthly)s?\b/;
 
@@ -80,6 +98,8 @@ export interface AccountGroup {
 	key: string;
 	/** Local part of the email before `@`, else the provider name — truncated to 10 chars. */
 	shortLabel: string;
+	/** Deterministic per-account icon — see `pickIcon`. */
+	icon: string;
 	rows: QuotaRow[];
 }
 
@@ -91,7 +111,7 @@ export function groupByAccount(rows: QuotaRow[]): AccountGroup[] {
 		let group = groups.get(key);
 		if (!group) {
 			const shortLabel = (row.email ? (row.email.split("@")[0] ?? row.email) : row.provider).slice(0, 10);
-			group = { key, shortLabel, rows: [] };
+			group = { key, shortLabel, icon: pickIcon(key), rows: [] };
 			groups.set(key, group);
 		}
 		group.rows.push(row);
@@ -101,6 +121,7 @@ export function groupByAccount(rows: QuotaRow[]): AccountGroup[] {
 
 export interface UrgentPick {
 	shortLabel: string;
+	icon: string;
 	displayPct: number;
 }
 
@@ -117,7 +138,7 @@ export function pickMostUrgent(group: AccountGroup, now: number): UrgentPick | u
 		const bucket = buildBucket(row.usedFraction * 100, row.resetsAt, parseWindowMs(row.windowLabel), now);
 		if (best === undefined || bucketDisplayPct(bucket) > bucketDisplayPct(best)) best = bucket;
 	}
-	return best ? { shortLabel: group.shortLabel, displayPct: bucketDisplayPct(best) } : undefined;
+	return best ? { shortLabel: group.shortLabel, icon: group.icon, displayPct: bucketDisplayPct(best) } : undefined;
 }
 
 /**
@@ -130,7 +151,7 @@ export function formatStatusLine(rows: QuotaRow[], now: number = Date.now()): st
 		const pick = pickMostUrgent(group, now);
 		if (!pick) continue;
 		const rounded = Math.round(pick.displayPct);
-		parts.push(`${pick.shortLabel}:${rounded}%${projectionLabel(pick.displayPct).emoji}`);
+		parts.push(`${pick.icon}${pick.shortLabel}:${rounded}%${projectionLabel(pick.displayPct).emoji}`);
 	}
 	return parts.length > 0 ? parts.join(" ") : undefined;
 }
