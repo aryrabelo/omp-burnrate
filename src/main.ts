@@ -1,38 +1,122 @@
 /**
- * @aryrabelo/omp-burnrate — per-account subscription/quota burn-rate in the OMP status bar.
+ * @aryrabelo/omp-burnrate — per-account subscription/quota burn-rate, listed once when OMP opens.
  *
- * Reads OMP's own quota-polling history and renders one `<label>:<pct>%<emoji>` segment per
- * distinct account (not just an aggregate), so running several Anthropic/Claude accounts plus
- * other providers side by side still shows each one's burn rate at a glance.
+ * Fetches OMP's own live usage (`omp usage --json`) a single time on `session_start` and renders
+ * one line per quota bucket per account, so running several Anthropic/Claude accounts plus other
+ * providers side by side still shows each one's burn rate at a glance — including every live
+ * bucket an account carries at once (5h window, overall weekly cap, a per-model weekly sub-cap).
+ *
+ * Each line carries a bar whose two `|` markers bracket the ideal point's +/-10% tolerance band,
+ * so pace reads off the bar directly: fill short of the first marker is under pace, between them
+ * is on pace, past the second is over pace. A leading color dot repeats that verdict, because the
+ * TUI's own text is not styleable from here.
+ *
+ * One widget per provider: the host caps a single widget at 10 lines ("... (widget truncated)"),
+ * and the full account list runs past that.
  */
 import type { ExtensionAPI, ExtensionContext } from "@oh-my-pi/pi-coding-agent";
-import { formatStatusLine } from "./burn-rate";
+import { buildStatusSegments, type Severity, type StatusSegment } from "./burn-rate";
 import { readQuotaSnapshot } from "./quota-source";
 
-const STATUS_KEY = "burnrate";
-/** Matches OMP's own quota-polling cadence elsewhere on this workstation. */
-const REFRESH_MS = 5 * 60 * 1000;
+/** Widget keys are `burnrate:<provider>` — kept so every one of them can be cleared later. */
+const KEY_PREFIX = "burnrate:";
 
-/** Render once. Never throws — a bad DB read must not kill the caller or the interval. */
-function render(ctx: ExtensionContext): void {
+/** Pace verdict at a glance. */
+const SEVERITY_DOT: Record<Severity, string> = { green: "🟢", yellow: "🟡", red: "🔴" };
+
+/** Accounts deliberately hidden: permanently-capped or otherwise uninteresting, matched on the
+ * short label (email local part, else provider name). */
+const HIDDEN_ACCOUNTS: Record<string, true> = { manager: true };
+
+/** Known-provider icons, so accounts sharing a provider are visually grouped even when their
+ * own names (person/role) give no hint. Unknown providers fall back to a circled first letter
+ * (Ⓐ..Ⓩ), so a brand-new provider still gets a distinguishing, deterministic mark. */
+const PROVIDER_ICONS: Record<string, string> = {
+	anthropic: "🟧",
+	"openai-codex": "✳️",
+	"kimi-code": "🌙",
+	zai: "⚡",
+};
+
+function providerIcon(provider: string): string {
+	const known = PROVIDER_ICONS[provider];
+	if (known) return known;
+	const code = provider.toUpperCase().charCodeAt(0);
+	return code >= 65 && code <= 90 ? String.fromCodePoint(0x24b6 + (code - 65)) : "▪";
+}
+
+/** Bar width in cells, excluding the two `|` markers. */
+const BAR_CELLS = 28;
+/** Half-width of the on-pace tolerance band, in percentage points. */
+const BAND_PCT = 10;
+
+/**
+ * `████████|██░|░░░░░░` — fill is actual usage, the two `|` bracket the ideal point's +/-10%
+ * tolerance band. Usage ending left of the first marker is under pace, past the second is over.
+ */
+function renderBar(used: number, expected: number): string {
+	const cell = (pct: number): number => Math.min(BAR_CELLS, Math.max(0, Math.round((pct / 100) * BAR_CELLS)));
+	const cells: string[] = Array.from({ length: BAR_CELLS }, (_, i) => (i < cell(used) ? "█" : "░"));
+	// Splice the upper marker first so the lower insertion cannot shift it.
+	cells.splice(cell(expected + BAND_PCT), 0, "|");
+	cells.splice(cell(expected - BAND_PCT), 0, "|");
+	return cells.join("");
+}
+
+/**
+ * `dot account label bar used% · ideal N%` lines, grouped into one entry per provider (worst
+ * pace first). Text columns are padded across ALL providers, so bars and markers stay aligned
+ * between widgets, not just inside one.
+ */
+function renderLists(segments: StatusSegment[]): Map<string, string[]> {
+	const nameWidth = Math.max(...segments.map((s) => s.label.length));
+	const labelWidth = Math.max(...segments.flatMap((s) => s.buckets.map((b) => b.label.length)));
+	const byProvider = new Map<string, string[]>();
+	for (const segment of segments) {
+		const who = `${providerIcon(segment.provider)}${segment.label.padEnd(nameWidth)}`;
+		const lines = byProvider.get(segment.provider) ?? [];
+		for (const b of segment.buckets) {
+			lines.push(
+				`${SEVERITY_DOT[b.severity]} ${who} ${b.label.padEnd(labelWidth)} ${renderBar(b.used, b.expected)} ${b.used}% used · ideal ${b.expected}%`,
+			);
+		}
+		byProvider.set(segment.provider, lines);
+	}
+	return byProvider;
+}
+
+/**
+ * Fetch and render once. Never throws — a failed `omp usage` call must not kill the session.
+ *
+ * ponytail: one live fetch per session, no refresh timer — `omp usage` is itself polled and
+ * cached by OMP, so re-running it on an interval would spend a subprocess to redraw the same
+ * numbers. Restart the session (or run `omp usage`) for a fresher read.
+ */
+async function render(ctx: ExtensionContext, keys: Set<string>): Promise<void> {
 	try {
-		ctx.ui.setStatus(STATUS_KEY, formatStatusLine(readQuotaSnapshot()));
+		const segments = buildStatusSegments(await readQuotaSnapshot()).filter((s) => !HIDDEN_ACCOUNTS[s.label]);
+		if (segments.length === 0) return;
+		for (const [provider, lines] of renderLists(segments)) {
+			const key = `${KEY_PREFIX}${provider}`;
+			keys.add(key);
+			ctx.ui.setWidget(key, lines, { placement: "aboveEditor" });
+		}
 	} catch {
-		// ponytail: status-bar hiccup is not worth surfacing; next tick retries.
+		// ponytail: a status-bar hiccup is not worth surfacing.
 	}
 }
 
 export default function burnRateExtension(pi: ExtensionAPI): void {
-	let timer: NodeJS.Timeout | undefined;
+	const keys = new Set<string>();
 
 	pi.on("session_start", (_event, ctx) => {
-		clearInterval(timer);
-		render(ctx);
-		timer = setInterval(() => render(ctx), REFRESH_MS);
+		void render(ctx, keys);
 	});
 
-	pi.on("session_shutdown", () => {
-		clearInterval(timer);
-		timer = undefined;
+	// The opening snapshot has served its purpose once the user starts working — drop the lists
+	// so they do not eat screen space all session.
+	pi.on("turn_start", (_event, ctx) => {
+		for (const key of keys) ctx.ui.setWidget(key, undefined);
+		keys.clear();
 	});
 }

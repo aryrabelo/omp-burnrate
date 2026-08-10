@@ -1,9 +1,17 @@
 /**
- * Pure burn-rate math and status-line formatting — no I/O, framework-free, unit-testable.
+ * Pure burn-rate math and status-line segment building — no I/O, no rendering, framework-free,
+ * unit-testable.
  *
- * Projection idea (ported from cnx-claude's quota-drift.ts `buildBucket`): extrapolate the
- * current usage pace to the window's reset time. If a window is 30% elapsed and already 30%
- * used, projected = 100% (right on pace to exactly fill the cap at reset).
+ * Expected-usage idea (ported from MegaAgentOs's `expectedFraction`/burn-rate ring,
+ * public/js/main.js): compare current usage against a linear, time-proportional baseline
+ * instead of extrapolating pace forward. `usedPct / expectedPct` ("ritmo"/pace ratio) is
+ * stable through the whole window — unlike a forward ratio projection, it can't explode right
+ * after a reset, because the denominator only ever shrinks toward 100, never toward 0.
+ *
+ * An account can carry several independent quota buckets at once (a 5-hour window, an overall
+ * weekly cap, a per-model weekly sub-cap, ...). Collapsing that down to one "most urgent"
+ * number hides whichever bucket didn't win, so every live bucket is surfaced, tagged by window
+ * duration, and colored by pace ratio (see main.ts for the render/color layer).
  */
 import type { QuotaRow } from "./quota-source";
 
@@ -12,53 +20,29 @@ const DAY_MS: number = 24 * HOUR_MS;
 const WEEK_MS: number = 7 * DAY_MS;
 const MONTH_MS: number = 30 * DAY_MS;
 
-/**
- * Distinct per-account icon, deterministic (same account key always maps to the same icon,
- * no config file to maintain as accounts get added/removed) — mirrors what the old Claude Code
- * statusline did with a hardcoded email→icon switch, minus the manual upkeep.
- */
-const ACCOUNT_ICONS = ["💻", "💼", "🔈", "🚀", "🛰️", "🧪", "🔋", "🛠️", "🌐", "🎯", "📡", "🧭", "🔬", "⚓", "🎧", "🪁"] as const;
-
-function hashCode(s: string): number {
-	let h = 0;
-	for (let i = 0; i < s.length; i++) h = (h * 31 + s.charCodeAt(i)) | 0;
-	return h >>> 0;
-}
-
-/** Stable icon for an account key (same input → same icon, across runs and processes). */
-export function pickIcon(key: string): string {
-	return ACCOUNT_ICONS[hashCode(key) % ACCOUNT_ICONS.length] as string;
-}
-
-/**
- * Assigns each group its preferred icon (`pickIcon`), resolving collisions by linear-probing
- * to the next free palette slot. Deterministic: groups are processed in key-sorted order, so
- * the same set of accounts always yields the same assignment, and every group gets a distinct
- * icon as long as there are no more accounts than palette entries.
- */
-function assignIcons(groups: AccountGroup[]): void {
-	const used = new Set<number>();
-	const sorted = [...groups].sort((a, b) => a.key.localeCompare(b.key));
-	for (const group of sorted) {
-		let index = hashCode(group.key) % ACCOUNT_ICONS.length;
-		for (let probe = 0; probe < ACCOUNT_ICONS.length && used.has(index); probe++) {
-			index = (index + 1) % ACCOUNT_ICONS.length;
-		}
-		used.add(index);
-		group.icon = ACCOUNT_ICONS[index] as string;
-	}
-}
-
 /** Leading-integer-plus-unit parser for free-text window labels ("7 Day", "5 Hour", "Weekly", "Monthly"). */
 const WINDOW_UNIT_RE = /^(\d+)?\s*(hour|hr|h|day|d|week|weekly|month|monthly)s?\b/;
 
 /**
- * Derive a window's length in ms from its free-text label. Returns `null` when no leading
- * integer+unit token can be parsed (e.g. "Usage window") — callers must skip projection then.
+ * Known non-standard labels that carry no parseable digit+unit (ported from MegaAgentOs's
+ * `WINDOW_SECS` table, public/js/main.js) — e.g. kimi-code's "Total quota" bucket is labelled
+ * "Usage window" but is actually a rolling 7-day cycle.
+ */
+const WINDOW_ALIASES: Record<string, number> = {
+	"usage window": WEEK_MS,
+};
+
+/**
+ * Derive a window's length in ms from its free-text label. Returns `null` when neither a
+ * known alias nor a leading integer+unit token can be parsed — callers must skip the expected
+ * baseline then.
  */
 export function parseWindowMs(windowLabel: string | null | undefined): number | null {
 	if (!windowLabel) return null;
-	const match = windowLabel.trim().toLowerCase().match(WINDOW_UNIT_RE);
+	const normalized = windowLabel.trim().toLowerCase();
+	const alias = WINDOW_ALIASES[normalized];
+	if (alias !== undefined) return alias;
+	const match = normalized.match(WINDOW_UNIT_RE);
 	if (!match) return null;
 	const count = match[1] ? Number(match[1]) : 1;
 	switch (match[2]) {
@@ -82,48 +66,57 @@ export function parseWindowMs(windowLabel: string | null | undefined): number | 
 
 export interface Bucket {
 	usedPct: number;
-	/** Extrapolated pct at reset when a projection was derivable; equals `usedPct` otherwise. */
-	projectedPct: number;
-	hasProjection: boolean;
+	/** Linear, time-proportional expected pct at this moment; null when the window's duration
+	 * or reset time can't be derived, or the reset time is already in the past (stale/dead row). */
+	expectedPct: number | null;
 	/** Ms until this window resets; 0 when unknown or already passed. */
 	msUntilReset: number;
+	/** This window's total duration in ms; null when not derivable. */
+	windowMs: number | null;
 }
 
 /**
- * Ported from cnx-claude's `buildBucket`: projects current pace to the reset moment.
- * No projection (raw pct only) when the window length or reset time is unknown/invalid,
- * or the window has barely started (elapsedPct < 1, where the ratio would explode).
+ * Ported from MegaAgentOs's `expectedFraction` (public/js/main.js). `expectedPct` is where
+ * usage would sit right now if it tracked the clock exactly — compare it against `usedPct` to
+ * see how far off an even pace ("ritmo") the account is, without the instability of forward
+ * extrapolation.
  */
 export function buildBucket(usedPct: number, resetsAt: number | null, windowMs: number | null, now: number): Bucket {
-	if (resetsAt === null || windowMs === null || windowMs <= 0) {
-		return { usedPct, projectedPct: usedPct, hasProjection: false, msUntilReset: 0 };
+	if (resetsAt === null || windowMs === null || windowMs <= 0 || resetsAt <= now) {
+		return { usedPct, expectedPct: null, msUntilReset: 0, windowMs: null };
 	}
-	const msUntilResetRaw = resetsAt - now;
-	const elapsedMs = Math.max(0, windowMs - msUntilResetRaw);
-	const elapsedPct = (elapsedMs / windowMs) * 100;
-	const projectedPct = elapsedPct >= 1 ? (usedPct / elapsedPct) * 100 : usedPct;
-	return { usedPct, projectedPct, hasProjection: true, msUntilReset: Math.max(0, msUntilResetRaw) };
+	const msUntilReset = resetsAt - now;
+	const elapsedMs = windowMs - msUntilReset;
+	const expectedPct = Math.max(0, Math.min(100, (elapsedMs / windowMs) * 100));
+	return { usedPct, expectedPct, msUntilReset, windowMs };
 }
 
-/** `90m` / `4h05m` / `2d03h` — human-relative time until reset. Ported from cnx-claude's `formatRelative`. */
-export function formatRelative(ms: number): string {
-	if (ms <= 0) return "0m";
-	const totalMin = Math.round(ms / 60_000);
-	const days = Math.floor(totalMin / 1440);
-	const hours = Math.floor((totalMin % 1440) / 60);
-	const minutes = totalMin % 60;
-	if (days > 0) return `${days}d${hours}h`;
-	if (hours > 0) return `${hours}h${String(minutes).padStart(2, "0")}m`;
-	return `${minutes}m`;
+export type Severity = "green" | "yellow" | "red";
+
+/**
+ * Pace-ratio band ("ritmo"): a +/-10% tolerance around the ideal point. At or under +10% is on
+ * pace, up to +30% is drifting, past that is alarming. The -10% edge needs no threshold —
+ * burning slower than ideal is never a warning.
+ */
+const PACE_YELLOW = 1.1;
+const PACE_RED = 1.3;
+
+/**
+ * `usedPct / expectedPct` — how many times faster than an even pace this bucket is burning.
+ * 0.7 reads "burning at 70% of the expected pace" (plenty of room); 1.3 reads "30% hotter than
+ * expected". `expectedPct <= 0` (right at/before a reset) is a division-by-zero edge case,
+ * resolved directly: any usage at all is maximally over pace, none is trivially on pace.
+ */
+export function paceRatio(usedPct: number, expectedPct: number): number {
+	if (expectedPct <= 0) return usedPct > 0 ? Number.POSITIVE_INFINITY : 0;
+	return usedPct / expectedPct;
 }
 
-export type BurnStatus = "over" | "near" | "ok";
-
-/** Ported from cnx-claude's `projectionLabel`, translated: over(>=100) / near(>=90) / ok. */
-export function projectionLabel(displayPct: number): { status: BurnStatus; emoji: string } {
-	if (displayPct >= 100) return { status: "over", emoji: "\u{1f534}" };
-	if (displayPct >= 90) return { status: "near", emoji: "\u{1f7e1}" };
-	return { status: "ok", emoji: "\u{1f7e2}" };
+/** `red` — pace ratio past `PACE_RED`; `yellow` — past `PACE_YELLOW` but not `PACE_RED`; `green` — at or under pace. */
+export function severityFromRatio(ratio: number): Severity {
+	if (ratio > PACE_RED) return "red";
+	if (ratio > PACE_YELLOW) return "yellow";
+	return "green";
 }
 
 export interface AccountGroup {
@@ -131,8 +124,10 @@ export interface AccountGroup {
 	key: string;
 	/** Local part of the email before `@`, else the provider name — truncated to 10 chars. */
 	shortLabel: string;
-	/** Deterministic per-account icon — see `pickIcon`. */
-	icon: string;
+	/** Which provider this account belongs to (`anthropic`, `openai-codex`, `kimi-code`, `zai`,
+	 * ...) — accounts named after a person/role (`manager`, `admin`) don't disclose this on
+	 * their own, so callers need it to render a provider icon. */
+	provider: string;
 	rows: QuotaRow[];
 }
 
@@ -144,73 +139,87 @@ export function groupByAccount(rows: QuotaRow[]): AccountGroup[] {
 		let group = groups.get(key);
 		if (!group) {
 			const shortLabel = (row.email ? (row.email.split("@")[0] ?? row.email) : row.provider).slice(0, 10);
-			group = { key, shortLabel, icon: "", rows: [] };
+			group = { key, shortLabel, provider: row.provider, rows: [] };
 			groups.set(key, group);
 		}
 		group.rows.push(row);
 	}
-	const list = [...groups.values()];
-	assignIcons(list);
-	return list;
+	return [...groups.values()];
 }
 
-export interface UrgentPick {
-	shortLabel: string;
-	icon: string;
+export interface QuotaBucketView {
+	/** The bucket's own label, e.g. `Claude 7 Day (Fable)`. */
+	label: string;
+	/** Rounded used pct (0-100+). */
+	used: number;
+	/** Rounded ideal pct at this instant — where usage "should" be if burned evenly. */
+	expected: number;
+	severity: Severity;
+}
+
+export interface StatusSegment {
+	label: string;
+	/** See `AccountGroup.provider` — lets callers render a provider icon. */
+	provider: string;
+	/** One entry per live bucket (dead/unknown buckets — no derivable expected baseline — are
+	 * dropped), ordered shortest window first. */
+	buckets: QuotaBucketView[];
+}
+
+interface LiveBucket {
+	windowMs: number;
+	label: string;
 	usedPct: number;
-	projectedPct: number;
-	hasProjection: boolean;
-	/** Ms until the picked window resets; 0 when unknown. */
-	msUntilReset: number;
+	expectedPct: number;
+	ratio: number;
 }
 
-/** Display value for a bucket: the projection when derivable, else the raw used pct. */
-function bucketDisplayPct(bucket: Bucket): number {
-	return bucket.hasProjection ? bucket.projectedPct : bucket.usedPct;
-}
-
-/** Picks the account's single most urgent window: highest projectedPct, else highest raw usedPct. */
-export function pickMostUrgent(group: AccountGroup, now: number): UrgentPick | undefined {
-	let best: Bucket | undefined;
+/** Live (non-dead/unknown) buckets for one account's rows, shortest window first. */
+function collectLiveBuckets(group: AccountGroup, now: number): LiveBucket[] {
+	const live: LiveBucket[] = [];
 	for (const row of group.rows) {
 		if (row.usedFraction === null) continue;
-		const bucket = buildBucket(row.usedFraction * 100, row.resetsAt, parseWindowMs(row.windowLabel), now);
-		if (best === undefined || bucketDisplayPct(bucket) > bucketDisplayPct(best)) best = bucket;
+		const windowMs = parseWindowMs(row.windowLabel);
+		const bucket = buildBucket(row.usedFraction * 100, row.resetsAt, windowMs, now);
+		if (bucket.expectedPct === null || windowMs === null) continue;
+		live.push({
+			windowMs,
+			label: row.label,
+			usedPct: bucket.usedPct,
+			expectedPct: bucket.expectedPct,
+			ratio: paceRatio(bucket.usedPct, bucket.expectedPct),
+		});
 	}
-	if (!best) return undefined;
-	return {
-		shortLabel: group.shortLabel,
-		icon: group.icon,
-		usedPct: best.usedPct,
-		projectedPct: best.projectedPct,
-		hasProjection: best.hasProjection,
-		msUntilReset: best.msUntilReset,
-	};
+	live.sort((a, b) => a.windowMs - b.windowMs);
+	return live;
 }
 
 /**
- * Full pipeline: quota rows → one combined status-bar string, one segment per distinct
- * account. Each segment shows the CURRENT used pct (bounded, intuitive) plus — when a
- * projection was derivable — how far off pace it is (`+N%`/`-N%` vs the 100% cap at reset)
- * and the time until reset, e.g. `💻aryrabelo 42%🔴(+58%/2h10m)`: 42% used now, but burning
- * fast enough to land 58 points over the cap by the time it resets in 2h10m. `undefined`
- * when there is no quota data to show at all.
+ * Full pipeline: quota rows → one segment per distinct account, each carrying every live quota
+ * bucket for that account (an account can have several at once — 5h, weekly, a per-model
+ * weekly sub-cap). Each bucket is colored by pace ratio, not raw percentage, so a heavily-used
+ * but genuinely on-pace bucket (e.g. 63% used with 90% of its 5h window elapsed) doesn't read
+ * as alarming next to a lightly-used bucket burning far ahead of pace (13% used with only 3% of
+ * its 7-day window elapsed).
+ *
+ * Segments are sorted by worst (highest) pace ratio across their buckets — the account with the
+ * hottest single bucket leads. `[]` when there is no quota data to show at all. Framework-free
+ * by design: callers own rendering/color (see main.ts).
  */
-export function formatStatusLine(rows: QuotaRow[], now: number = Date.now()): string | undefined {
-	const parts: string[] = [];
+export function buildStatusSegments(rows: QuotaRow[], now: number = Date.now()): StatusSegment[] {
+	const scored: { segment: StatusSegment; worstRatio: number }[] = [];
 	for (const group of groupByAccount(rows)) {
-		const pick = pickMostUrgent(group, now);
-		if (!pick) continue;
-		const usedRounded = Math.round(pick.usedPct);
-		if (!pick.hasProjection) {
-			parts.push(`${pick.icon}${pick.shortLabel} ${usedRounded}%`);
-			continue;
-		}
-		const delta = Math.max(-100, Math.min(999, Math.round(pick.projectedPct) - 100));
-		const sign = delta > 0 ? "+" : "";
-		const emoji = projectionLabel(pick.projectedPct).emoji;
-		const eta = formatRelative(pick.msUntilReset);
-		parts.push(`${pick.icon}${pick.shortLabel} ${usedRounded}%${emoji}(${sign}${delta}%/${eta})`);
+		const live = collectLiveBuckets(group, now);
+		if (live.length === 0) continue;
+		const buckets: QuotaBucketView[] = live.map((b) => ({
+			label: b.label,
+			used: Math.round(b.usedPct),
+			expected: Math.round(b.expectedPct),
+			severity: severityFromRatio(b.ratio),
+		}));
+		const worstRatio = Math.max(...live.map((b) => b.ratio));
+		scored.push({ segment: { label: group.shortLabel, provider: group.provider, buckets }, worstRatio });
 	}
-	return parts.length > 0 ? parts.join(" ") : undefined;
+	scored.sort((a, b) => b.worstRatio - a.worstRatio);
+	return scored.map((s) => s.segment);
 }

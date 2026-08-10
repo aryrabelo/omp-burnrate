@@ -1,13 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import {
-	buildBucket,
-	formatStatusLine,
-	groupByAccount,
-	parseWindowMs,
-	pickIcon,
-	pickMostUrgent,
-	projectionLabel,
-} from "../src/burn-rate";
+import { buildBucket, buildStatusSegments, groupByAccount, paceRatio, parseWindowMs, severityFromRatio } from "../src/burn-rate";
 import type { QuotaRow } from "../src/quota-source";
 
 const HOUR_MS: number = 60 * 60 * 1000;
@@ -40,8 +32,13 @@ describe("parseWindowMs", () => {
 		expect(parseWindowMs("Monthly")).toBe(30 * DAY_MS);
 	});
 
-	test("returns null for unrecognized free text", () => {
-		expect(parseWindowMs("Usage window")).toBeNull();
+	test("resolves known non-standard labels via alias (kimi-code's mislabeled 7-day window)", () => {
+		expect(parseWindowMs("Usage window")).toBe(7 * DAY_MS);
+		expect(parseWindowMs("USAGE WINDOW")).toBe(7 * DAY_MS);
+	});
+
+	test("returns null for truly unrecognized free text", () => {
+		expect(parseWindowMs("something else entirely")).toBeNull();
 		expect(parseWindowMs(null)).toBeNull();
 		expect(parseWindowMs(undefined)).toBeNull();
 	});
@@ -50,51 +47,72 @@ describe("parseWindowMs", () => {
 describe("buildBucket", () => {
 	const now = 1_000_000;
 
-	test("no projection when resetsAt is missing", () => {
+	test("no expected baseline when resetsAt is missing", () => {
 		const bucket = buildBucket(42, null, 7 * DAY_MS, now);
-		expect(bucket.hasProjection).toBe(false);
-		expect(bucket.projectedPct).toBe(42);
+		expect(bucket.expectedPct).toBeNull();
+		expect(bucket.usedPct).toBe(42);
 	});
 
-	test("no projection when windowMs is missing or non-positive", () => {
-		expect(buildBucket(42, now + HOUR_MS, null, now).hasProjection).toBe(false);
-		expect(buildBucket(42, now + HOUR_MS, 0, now).hasProjection).toBe(false);
-		expect(buildBucket(42, now + HOUR_MS, -1, now).hasProjection).toBe(false);
+	test("no expected baseline when windowMs is missing or non-positive", () => {
+		expect(buildBucket(42, now + HOUR_MS, null, now).expectedPct).toBeNull();
+		expect(buildBucket(42, now + HOUR_MS, 0, now).expectedPct).toBeNull();
+		expect(buildBucket(42, now + HOUR_MS, -1, now).expectedPct).toBeNull();
 	});
 
-	test("falls back to raw pct when the window has barely started (elapsedPct < 1)", () => {
-		// 7-day window, 59 minutes elapsed (~0.58%) — below the 1% floor.
+	test("no expected baseline when resetsAt is already in the past (stale/dead row)", () => {
+		const bucket = buildBucket(4, now - HOUR_MS, 7 * DAY_MS, now);
+		expect(bucket.expectedPct).toBeNull();
+		expect(bucket.msUntilReset).toBe(0);
+	});
+
+	test("stays small right after a reset, unlike a forward ratio projection would explode", () => {
+		// 7-day window, 59 minutes elapsed (~0.58%).
 		const windowMs = 7 * DAY_MS;
 		const resetsAt = now + windowMs - 59 * 60 * 1000;
 		const bucket = buildBucket(10, resetsAt, windowMs, now);
-		expect(bucket.hasProjection).toBe(true);
-		expect(bucket.projectedPct).toBe(10);
+		expect(bucket.expectedPct).toBeCloseTo(0.58, 1);
 	});
 
-	test("projects usage to the reset moment once enough of the window has elapsed", () => {
-		// 10-hour window, 5 hours elapsed (50%), 25% used so far → projects to 50% at reset.
+	test("expected tracks elapsed time linearly, independent of usedPct", () => {
+		// 10-hour window, 5 hours elapsed → 50% expected regardless of usage.
 		const windowMs = 10 * HOUR_MS;
 		const resetsAt = now + windowMs / 2;
 		const bucket = buildBucket(25, resetsAt, windowMs, now);
-		expect(bucket.hasProjection).toBe(true);
-		expect(bucket.projectedPct).toBeCloseTo(50, 5);
+		expect(bucket.expectedPct).toBeCloseTo(50, 5);
 	});
 });
 
-describe("projectionLabel", () => {
-	test("over at >= 100", () => {
-		expect(projectionLabel(100).status).toBe("over");
-		expect(projectionLabel(150).status).toBe("over");
+describe("paceRatio", () => {
+	test("used/expected when expected is positive", () => {
+		expect(paceRatio(70, 100)).toBeCloseTo(0.7, 5);
+		expect(paceRatio(130, 100)).toBeCloseTo(1.3, 5);
 	});
 
-	test("near at >= 90 and < 100", () => {
-		expect(projectionLabel(90).status).toBe("near");
-		expect(projectionLabel(99.9).status).toBe("near");
+	test("positive infinity when expected is zero and something was used (max over pace)", () => {
+		expect(paceRatio(5, 0)).toBe(Number.POSITIVE_INFINITY);
 	});
 
-	test("ok below 90", () => {
-		expect(projectionLabel(0).status).toBe("ok");
-		expect(projectionLabel(89.9).status).toBe("ok");
+	test("zero when expected is zero and nothing was used (trivially on pace)", () => {
+		expect(paceRatio(0, 0)).toBe(0);
+	});
+});
+
+describe("severityFromRatio", () => {
+	test("green inside the +/-10% tolerance band around the ideal point", () => {
+		expect(severityFromRatio(0)).toBe("green");
+		expect(severityFromRatio(0.7)).toBe("green");
+		expect(severityFromRatio(1.0)).toBe("green");
+		expect(severityFromRatio(1.1)).toBe("green");
+	});
+
+	test("yellow past the band, up to and including 1.3", () => {
+		expect(severityFromRatio(1.11)).toBe("yellow");
+		expect(severityFromRatio(1.3)).toBe("yellow");
+	});
+
+	test("red past 1.3", () => {
+		expect(severityFromRatio(1.31)).toBe("red");
+		expect(severityFromRatio(4.6)).toBe("red");
 	});
 });
 
@@ -157,19 +175,9 @@ describe("groupByAccount", () => {
 		expect(groups.find((g) => g.key === "account:aaa")?.shortLabel).toBe("aryrabelo");
 	});
 
-	test("assigns a stable icon per account, deterministic across calls", () => {
-		const first = groupByAccount(rows);
-		const second = groupByAccount(rows);
-		expect(first.map((g) => g.icon)).toEqual(second.map((g) => g.icon));
-		expect(first.find((g) => g.key === "account:aaa")?.icon).toBe(pickIcon("account:aaa"));
-	});
-
-	test("guarantees distinct icons for as many accounts as the palette holds (16), even under hash collisions", () => {
-		const manyAccounts = Array.from({ length: 16 }, (_, i) =>
-			row({ provider: "anthropic", accountKey: "oauth", accountId: `account:${i}`, label: "L" }),
-		);
-		const icons = groupByAccount(manyAccounts).map((g) => g.icon);
-		expect(new Set(icons).size).toBe(16);
+	test("carries the row's provider so a caller can render a provider icon", () => {
+		const groups = groupByAccount(rows);
+		expect(groups.find((g) => g.key === "account:aaa")?.provider).toBe("anthropic");
 	});
 
 	test("falls back to provider+accountKey when accountId and email are both absent", () => {
@@ -186,57 +194,24 @@ describe("groupByAccount", () => {
 	});
 });
 
-describe("pickMostUrgent", () => {
-	test("picks the window with the highest projected pct, not just the highest raw usedFraction", () => {
+describe("buildStatusSegments", () => {
+	test("returns [] when there is no quota data", () => {
+		expect(buildStatusSegments([])).toEqual([]);
+	});
+
+	test("omits an account whose only bucket has no derivable window (dead/unknown, not shown)", () => {
+		const rows: QuotaRow[] = [row({ provider: "kimi-code", accountKey: "secret:xyz", label: "custom cycle", usedFraction: 0.1 })];
+		expect(buildStatusSegments(rows, 1_000_000)).toEqual([]);
+	});
+
+	test("one live bucket: severity from pace ratio, expected pct from elapsed window", () => {
 		const now = 1_000_000;
-		const windowMs = 10 * HOUR_MS;
-		const group = {
-			key: "acct",
-			shortLabel: "acct",
-			icon: pickIcon("acct"),
-			rows: [
-				// Raw 60% used, but window barely started (no projection possible without windowLabel).
-				row({ provider: "anthropic", accountKey: "oauth", label: "A", usedFraction: 0.6 }),
-				// Raw 25% used, but window half elapsed → projects to 50%, more urgent.
-				row({
-					provider: "anthropic",
-					accountKey: "oauth",
-					label: "B",
-					windowLabel: "10 Hour",
-					usedFraction: 0.25,
-					resetsAt: now + windowMs / 2,
-				}),
-			],
-		};
-		const pick = pickMostUrgent(group, now);
-		expect(pick?.hasProjection).toBe(false);
-		expect(pick?.usedPct).toBeCloseTo(60, 5);
-	});
-
-	test("skips rows with null usedFraction and returns undefined when none remain", () => {
-		const group = {
-			key: "acct",
-			shortLabel: "acct",
-			icon: pickIcon("acct"),
-			rows: [row({ provider: "anthropic", accountKey: "oauth", label: "A", usedFraction: null })],
-		};
-		expect(pickMostUrgent(group, Date.now())).toBeUndefined();
-	});
-});
-
-describe("formatStatusLine", () => {
-	test("returns undefined when there is no quota data", () => {
-		expect(formatStatusLine([])).toBeUndefined();
-	});
-
-	test("shows the current used% plus pace delta and ETA when a projection is derivable", () => {
-		const now = 1_000_000;
-		// 10h window, 5h elapsed (50%), 30% used so far → projects to 60% at reset (under pace).
+		// 10h window, 5h elapsed (50% expected), 30% used → ratio 0.6 → green.
 		const rows: QuotaRow[] = [
 			row({
 				provider: "anthropic",
 				accountKey: "oauth",
-				accountId: "account:aaa",
+				accountId: "a",
 				email: "aryrabelo@gmail.com",
 				label: "Claude 10 Hour",
 				windowLabel: "10 Hour",
@@ -244,16 +219,80 @@ describe("formatStatusLine", () => {
 				resetsAt: now + 5 * HOUR_MS,
 			}),
 		];
-		const line = formatStatusLine(rows, now);
-		expect(line).toContain("aryrabelo 30%\u{1f7e2}(-40%/5h00m)");
+		const segments = buildStatusSegments(rows, now);
+		expect(segments).toEqual([
+			{ label: "aryrabelo", provider: "anthropic", buckets: [{ label: "Claude 10 Hour", used: 30, expected: 50, severity: "green" }] },
+		]);
 	});
 
-	test("omits pace delta and ETA when no window length is derivable — shows raw used% only", () => {
+	test("drops dead/unknown buckets but keeps live ones for the same account", () => {
 		const now = 1_000_000;
 		const rows: QuotaRow[] = [
-			row({ provider: "kimi-code", accountKey: "secret:xyz", label: "Usage window", usedFraction: 0.1 }),
+			row({ provider: "anthropic", accountKey: "oauth", accountId: "a", label: "Claude 5 Hour", windowLabel: "5 Hour", usedFraction: 0.6, resetsAt: now + 2.5 * HOUR_MS }),
+			// Stale: resetsAt already in the past — no derivable expected baseline.
+			row({ provider: "anthropic", accountKey: "oauth", accountId: "a", label: "Claude 7 Day (Sonnet)", windowLabel: "7 Day", usedFraction: 0, resetsAt: now - HOUR_MS }),
 		];
-		const line = formatStatusLine(rows, now);
-		expect(line).toBe(`${pickIcon("kimi-code:secret:xyz")}kimi-code 10%`);
+		const segments = buildStatusSegments(rows, now);
+		expect(segments).toHaveLength(1);
+		expect(segments[0]?.buckets).toHaveLength(1);
+	});
+
+	test("orders buckets shortest window first", () => {
+		const now = 1_000_000;
+		const rows: QuotaRow[] = [
+			row({ provider: "anthropic", accountKey: "oauth", accountId: "a", label: "Claude 7 Day", windowLabel: "7 Day", usedFraction: 0.13, resetsAt: now + 163 * HOUR_MS }),
+			row({ provider: "anthropic", accountKey: "oauth", accountId: "a", label: "Claude 7 Day (Fable)", windowLabel: "7 Day", usedFraction: 0.1, resetsAt: now + 163 * HOUR_MS }),
+			row({ provider: "anthropic", accountKey: "oauth", accountId: "a", label: "Claude 5 Hour", windowLabel: "5 Hour", usedFraction: 0.63, resetsAt: now + 0.5 * HOUR_MS }),
+			row({ provider: "anthropic", accountKey: "oauth", accountId: "a", label: "Claude 30 Day", windowLabel: "30 Day", usedFraction: 0.05, resetsAt: now + 700 * HOUR_MS }),
+		];
+		const segments = buildStatusSegments(rows, now);
+		expect(segments[0]?.buckets.map((b) => b.label)).toEqual(["Claude 5 Hour", "Claude 7 Day", "Claude 7 Day (Fable)", "Claude 30 Day"]);
+	});
+
+	test("real scenario: a healthy 5h bucket doesn't hide an over-pace weekly bucket — both show, weekly is red", () => {
+		const now = 1_000_000;
+		// 5h bucket: 63% used, 90% of window elapsed → ratio 0.7 → green.
+		// Weekly bucket: 13% used, only ~2.8% of window elapsed → ratio ~4.6 → red.
+		const rows: QuotaRow[] = [
+			row({
+				provider: "anthropic",
+				accountKey: "oauth",
+				accountId: "a",
+				email: "fiamclaude@duaud.io",
+				label: "Claude 5 Hour",
+				windowLabel: "5 Hour",
+				usedFraction: 0.63,
+				resetsAt: now + 0.5 * HOUR_MS,
+			}),
+			row({
+				provider: "anthropic",
+				accountKey: "oauth",
+				accountId: "a",
+				email: "fiamclaude@duaud.io",
+				label: "Claude 7 Day",
+				windowLabel: "7 Day",
+				usedFraction: 0.13,
+				resetsAt: now + 163.3 * HOUR_MS,
+			}),
+		];
+		const segments = buildStatusSegments(rows, now);
+		expect(segments[0]?.buckets).toEqual([
+			{ label: "Claude 5 Hour", used: 63, expected: 90, severity: "green" },
+			{ label: "Claude 7 Day", used: 13, expected: 3, severity: "red" },
+		]);
+	});
+
+	test("sorts accounts by worst pace ratio across their buckets, descending", () => {
+		const now = 1_000_000;
+		const rows: QuotaRow[] = [
+			// A: 30% used, 50% elapsed → ratio 0.6, green.
+			row({ provider: "p", accountKey: "A", accountId: "a", email: "A@x.io", label: "L", windowLabel: "10 Hour", usedFraction: 0.3, resetsAt: now + 5 * HOUR_MS }),
+			// B: 90% used, 50% elapsed → ratio 1.8, red.
+			row({ provider: "p", accountKey: "B", accountId: "b", email: "B@x.io", label: "L", windowLabel: "10 Hour", usedFraction: 0.9, resetsAt: now + 5 * HOUR_MS }),
+			// C: 55% used, 50% elapsed → ratio 1.1, yellow.
+			row({ provider: "p", accountKey: "C", accountId: "c", email: "C@x.io", label: "L", windowLabel: "10 Hour", usedFraction: 0.55, resetsAt: now + 5 * HOUR_MS }),
+		];
+		const labels = buildStatusSegments(rows, now).map((s) => s.label);
+		expect(labels).toEqual(["B", "C", "A"]);
 	});
 });
