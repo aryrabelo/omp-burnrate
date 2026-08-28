@@ -155,6 +155,8 @@ export interface QuotaBucketView {
 	/** Rounded ideal pct at this instant — where usage "should" be if burned evenly. */
 	expected: number;
 	severity: Severity;
+	/** Week-scale-or-longer window (the slow quota that matters most) — renderers emphasize it. */
+	highlight: boolean;
 }
 
 export interface StatusSegment {
@@ -198,24 +200,31 @@ function collectLiveBuckets(group: AccountGroup, now: number): LiveBucket[] {
  * Full pipeline: quota rows → one segment per distinct account, each carrying every live quota
  * bucket for that account (an account can have several at once — 5h, weekly, a per-model
  * weekly sub-cap). Each bucket is colored by pace ratio, not raw percentage, so a heavily-used
- * but genuinely on-pace bucket (e.g. 63% used with 90% of its 5h window elapsed) doesn't read
- * as alarming next to a lightly-used bucket burning far ahead of pace (13% used with only 3% of
- * its 7-day window elapsed).
+ * but genuinely on-pace bucket doesn't read as alarming next to a lightly-used bucket burning
+ * far ahead of pace.
  *
- * Segments are sorted by worst (highest) pace ratio across their buckets — the account with the
- * hottest single bucket leads. `[]` when there is no quota data to show at all. Framework-free
- * by design: callers own rendering/color (see main.ts).
+ * Two display rules live here so callers stay dumb:
+ * - On-pace (green) hour-scale buckets (< 1 day) are dropped — a healthy short window is noise,
+ *   the long window is the headline. Off-pace short windows still show.
+ * - Week-scale-or-longer buckets carry `highlight: true` — renderers emphasize the weekly bar.
+ *
+ * Segments are sorted by worst (highest) pace ratio across their surviving buckets — the
+ * account with the hottest single bucket leads. `[]` when there is no quota data to show at
+ * all. Framework-free by design: callers own rendering/color (see main.ts).
  */
 export function buildStatusSegments(rows: QuotaRow[], now: number = Date.now()): StatusSegment[] {
 	const scored: { segment: StatusSegment; worstRatio: number }[] = [];
 	for (const group of groupByAccount(rows)) {
-		const live = collectLiveBuckets(group, now);
+		const live = collectLiveBuckets(group, now).filter(
+			(b) => !(b.windowMs < DAY_MS && severityFromRatio(b.ratio) === "green"),
+		);
 		if (live.length === 0) continue;
 		const buckets: QuotaBucketView[] = live.map((b) => ({
 			label: b.label,
 			used: Math.round(b.usedPct),
 			expected: Math.round(b.expectedPct),
 			severity: severityFromRatio(b.ratio),
+			highlight: b.windowMs >= WEEK_MS,
 		}));
 		const worstRatio = Math.max(...live.map((b) => b.ratio));
 		scored.push({ segment: { label: group.shortLabel, provider: group.provider, buckets }, worstRatio });

@@ -21,12 +21,13 @@ hides whichever bucket didn't win — e.g. a healthy 5-hour bucket can outrank
 pace, because the weekly one is numerically smaller this early in its window.
 
 ```
-🟢 🟧aryrabelo  Claude 5 Hour           ███░░░░░░░░░░░░░░░|░░░░░░|░░░░ 10% used · ideal 76%
 🔴 🟧aryrabelo  Claude 7 Day            ████████|█████|█░░░░░░░░░░░░░░ 50% used · ideal 37%
 🔴 🟧aryrabelo  Claude 7 Day (Fable)    ████████|█████|████░░░░░░░░░░░ 59% used · ideal 37%
 🟡 🟧fiamclaude Claude 7 Day            █████████████|██████|░░░░░░░░░ 68% used · ideal 57%
 🟡 🟧fiamclaude Claude 7 Day (Fable)    █████████████|██████|░░░░░░░░░ 68% used · ideal 57%
 ```
+
+(In the terminal these rows render **bold** — see the display rules below.)
 
 **The two `|` markers bracket the ideal point's ±10% tolerance band.** Fill
 ending left of the first marker is under pace, between them is on pace, past
@@ -51,6 +52,14 @@ elapsed (ratio ~4.6).
 - 🔴 red — pace ratio > 1.3 (burning noticeably faster than the clock).
 - 🟡 yellow — pace ratio > 1.1 up to 1.3.
 - 🟢 green — pace ratio ≤ 1.1 (inside the ±10% tolerance band, or under pace).
+
+**Display rules:** the long window is the headline. Week-scale-or-longer
+buckets (7 Day, Monthly, ...) always show and render **bold**. On-pace (🟢)
+*short*-window buckets — anything under a day, e.g. a healthy 5-hour quota —
+are hidden entirely: while a short window is inside its tolerance band it's
+noise, and it reappears the moment it burns past pace (🟡/🔴). An account
+whose only live bucket is a healthy short window stays out of the list until
+something is actually off.
 
 **Accounts can be hidden** — `HIDDEN_ACCOUNTS` in `src/main.ts` drops
 permanently-capped or uninteresting accounts (`manager` by default) by short

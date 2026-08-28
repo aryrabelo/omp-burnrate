@@ -50,6 +50,11 @@ const BAR_CELLS = 28;
 /** Half-width of the on-pace tolerance band, in percentage points. */
 const BAND_PCT = 10;
 
+/** ANSI bold for highlighted rows (week-scale quotas) — escapes are zero-width in pi-tui rows,
+ * so column alignment computed on the visible text is unaffected. */
+const BOLD_ON = "\x1b[1m";
+const BOLD_OFF = "\x1b[22m";
+
 /**
  * `████████|██░|░░░░░░` — fill is actual usage, the two `|` bracket the ideal point's +/-10%
  * tolerance band. Usage ending left of the first marker is under pace, past the second is over.
@@ -76,9 +81,9 @@ function renderLists(segments: StatusSegment[]): Map<string, string[]> {
 		const who = `${providerIcon(segment.provider)}${segment.label.padEnd(nameWidth)}`;
 		const lines = byProvider.get(segment.provider) ?? [];
 		for (const b of segment.buckets) {
-			lines.push(
-				`${SEVERITY_DOT[b.severity]} ${who} ${b.label.padEnd(labelWidth)} ${renderBar(b.used, b.expected)} ${b.used}% used · ideal ${b.expected}%`,
-			);
+			const line = `${SEVERITY_DOT[b.severity]} ${who} ${b.label.padEnd(labelWidth)} ${renderBar(b.used, b.expected)} ${b.used}% used · ideal ${b.expected}%`;
+			// The weekly-scale bar is the headline — bold it.
+			lines.push(b.highlight ? BOLD_ON + line + BOLD_OFF : line);
 		}
 		byProvider.set(segment.provider, lines);
 	}
