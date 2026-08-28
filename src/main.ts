@@ -50,10 +50,13 @@ const BAR_CELLS = 28;
 /** Half-width of the on-pace tolerance band, in percentage points. */
 const BAND_PCT = 10;
 
-/** ANSI bold for highlighted rows (week-scale quotas) — escapes are zero-width in pi-tui rows,
- * so column alignment computed on the visible text is unaffected. */
+/** Emphasis for highlighted rows (week-scale quotas): theme accent color over ANSI bold.
+ * Both are plain SGR escapes — measured zero-width in pi-tui rows (2026-08-28, raw pty
+ * capture), so column alignment computed on the visible text is unaffected. */
 const BOLD_ON = "\x1b[1m";
 const BOLD_OFF = "\x1b[22m";
+/** Structural type instead of importing Theme: survives minor API shuffles. */
+type ThemeLike = { fg: (color: string, text: string) => string };
 
 /**
  * `████████|██░|░░░░░░` — fill is actual usage, the two `|` bracket the ideal point's +/-10%
@@ -73,7 +76,7 @@ function renderBar(used: number, expected: number): string {
  * pace first). Text columns are padded across ALL providers, so bars and markers stay aligned
  * between widgets, not just inside one.
  */
-function renderLists(segments: StatusSegment[]): Map<string, string[]> {
+function renderLists(segments: StatusSegment[], paint: (line: string) => string): Map<string, string[]> {
 	const nameWidth = Math.max(...segments.map((s) => s.label.length));
 	const labelWidth = Math.max(...segments.flatMap((s) => s.buckets.map((b) => b.label.length)));
 	const byProvider = new Map<string, string[]>();
@@ -82,8 +85,8 @@ function renderLists(segments: StatusSegment[]): Map<string, string[]> {
 		const lines = byProvider.get(segment.provider) ?? [];
 		for (const b of segment.buckets) {
 			const line = `${SEVERITY_DOT[b.severity]} ${who} ${b.label.padEnd(labelWidth)} ${renderBar(b.used, b.expected)} ${b.used}% used · ideal ${b.expected}%`;
-			// The weekly-scale bar is the headline — bold it.
-			lines.push(b.highlight ? BOLD_ON + line + BOLD_OFF : line);
+			// The weekly-scale bar is the headline — accent color over bold.
+			lines.push(b.highlight ? paint(BOLD_ON + line + BOLD_OFF) : line);
 		}
 		byProvider.set(segment.provider, lines);
 	}
@@ -101,7 +104,10 @@ async function render(ctx: ExtensionContext, keys: Set<string>): Promise<void> {
 	try {
 		const segments = buildStatusSegments(await readQuotaSnapshot()).filter((s) => !HIDDEN_ACCOUNTS[s.label]);
 		if (segments.length === 0) return;
-		for (const [provider, lines] of renderLists(segments)) {
+		// print/headless UIs may not expose a theme; plain bold is the fallback.
+		const theme = ctx.ui.theme as ThemeLike | undefined;
+		const paint = (line: string): string => (theme?.fg ? theme.fg("accent", line) : line);
+		for (const [provider, lines] of renderLists(segments, paint)) {
 			const key = `${KEY_PREFIX}${provider}`;
 			keys.add(key);
 			ctx.ui.setWidget(key, lines, { placement: "aboveEditor" });
