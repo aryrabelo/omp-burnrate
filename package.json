@@ -1,6 +1,6 @@
 {
 	"name": "@aryrabelo/omp-burnrate",
-	"version": "0.3.1",
+	"version": "0.3.2",
 	"description": "OMP harness extension: per-account subscription/quota burn-rate in the status bar (multi-account aware, not just an aggregate).",
 	"type": "module",
 	"license": "MIT",

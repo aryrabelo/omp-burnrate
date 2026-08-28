@@ -15,14 +15,23 @@
  * and the full account list runs past that.
  */
 import type { ExtensionAPI, ExtensionContext } from "@oh-my-pi/pi-coding-agent";
-import { buildStatusSegments, type Severity, type StatusSegment } from "./burn-rate";
+import {
+	buildStatusSegments,
+	type QuotaBucketView,
+	type Severity,
+	type StatusSegment,
+} from "./burn-rate";
 import { readQuotaSnapshot } from "./quota-source";
 
 /** Widget keys are `burnrate:<provider>` — kept so every one of them can be cleared later. */
 const KEY_PREFIX = "burnrate:";
 
 /** Pace verdict at a glance. */
-const SEVERITY_DOT: Record<Severity, string> = { green: "🟢", yellow: "🟡", red: "🔴" };
+const SEVERITY_DOT: Record<Severity, string> = {
+	green: "🟢",
+	yellow: "🟡",
+	red: "🔴",
+};
 
 /** Accounts deliberately hidden: permanently-capped or otherwise uninteresting, matched on the
  * short label (email local part, else provider name). */
@@ -42,7 +51,9 @@ function providerIcon(provider: string): string {
 	const known = PROVIDER_ICONS[provider];
 	if (known) return known;
 	const code = provider.toUpperCase().charCodeAt(0);
-	return code >= 65 && code <= 90 ? String.fromCodePoint(0x24b6 + (code - 65)) : "▪";
+	return code >= 65 && code <= 90
+		? String.fromCodePoint(0x24b6 + (code - 65))
+		: "▪";
 }
 
 /** Bar width in cells, excluding the two `|` markers. */
@@ -63,8 +74,11 @@ type ThemeLike = { fg: (color: string, text: string) => string };
  * tolerance band. Usage ending left of the first marker is under pace, past the second is over.
  */
 function renderBar(used: number, expected: number): string {
-	const cell = (pct: number): number => Math.min(BAR_CELLS, Math.max(0, Math.round((pct / 100) * BAR_CELLS)));
-	const cells: string[] = Array.from({ length: BAR_CELLS }, (_, i) => (i < cell(used) ? "█" : "░"));
+	const cell = (pct: number): number =>
+		Math.min(BAR_CELLS, Math.max(0, Math.round((pct / 100) * BAR_CELLS)));
+	const cells: string[] = Array.from({ length: BAR_CELLS }, (_, i) =>
+		i < cell(used) ? "█" : "░",
+	);
 	// Splice the upper marker first so the lower insertion cannot shift it.
 	cells.splice(cell(expected + BAND_PCT), 0, "|");
 	cells.splice(cell(expected - BAND_PCT), 0, "|");
@@ -76,17 +90,36 @@ function renderBar(used: number, expected: number): string {
  * pace first). Text columns are padded across ALL providers, so bars and markers stay aligned
  * between widgets, not just inside one.
  */
-function renderLists(segments: StatusSegment[], paint: (line: string) => string): Map<string, string[]> {
+
+/** One widget row: error-colored when over pace, accent over bold for aggregate weekly caps,
+ * plain otherwise. */
+function renderBucketLine(
+	b: QuotaBucketView,
+	who: string,
+	labelWidth: number,
+	paint: (color: string, text: string) => string,
+): string {
+	const line = `${SEVERITY_DOT[b.severity]} ${who} ${b.label.padEnd(labelWidth)} ${renderBar(b.used, b.expected)} ${b.used}% used · ideal ${b.expected}%`;
+	if (b.severity === "red") return paint("error", line);
+	if (b.highlight) return paint("accent", BOLD_ON + line + BOLD_OFF);
+	return line;
+}
+function renderLists(
+	segments: StatusSegment[],
+	theme: ThemeLike | undefined,
+): Map<string, string[]> {
 	const nameWidth = Math.max(...segments.map((s) => s.label.length));
-	const labelWidth = Math.max(...segments.flatMap((s) => s.buckets.map((b) => b.label.length)));
+	const labelWidth = Math.max(
+		...segments.flatMap((s) => s.buckets.map((b) => b.label.length)),
+	);
+	const paint = (color: string, text: string): string =>
+		theme?.fg ? theme.fg(color, text) : text;
 	const byProvider = new Map<string, string[]>();
 	for (const segment of segments) {
 		const who = `${providerIcon(segment.provider)}${segment.label.padEnd(nameWidth)}`;
 		const lines = byProvider.get(segment.provider) ?? [];
 		for (const b of segment.buckets) {
-			const line = `${SEVERITY_DOT[b.severity]} ${who} ${b.label.padEnd(labelWidth)} ${renderBar(b.used, b.expected)} ${b.used}% used · ideal ${b.expected}%`;
-			// The weekly-scale bar is the headline — accent color over bold.
-			lines.push(b.highlight ? paint(BOLD_ON + line + BOLD_OFF) : line);
+			lines.push(renderBucketLine(b, who, labelWidth, paint));
 		}
 		byProvider.set(segment.provider, lines);
 	}
@@ -102,12 +135,13 @@ function renderLists(segments: StatusSegment[], paint: (line: string) => string)
  */
 async function render(ctx: ExtensionContext, keys: Set<string>): Promise<void> {
 	try {
-		const segments = buildStatusSegments(await readQuotaSnapshot()).filter((s) => !HIDDEN_ACCOUNTS[s.label]);
+		const segments = buildStatusSegments(await readQuotaSnapshot()).filter(
+			(s) => !HIDDEN_ACCOUNTS[s.label],
+		);
 		if (segments.length === 0) return;
-		// print/headless UIs may not expose a theme; plain bold is the fallback.
+		// print/headless UIs may not expose a theme; rows degrade to plain/bold-only.
 		const theme = ctx.ui.theme as ThemeLike | undefined;
-		const paint = (line: string): string => (theme?.fg ? theme.fg("accent", line) : line);
-		for (const [provider, lines] of renderLists(segments, paint)) {
+		for (const [provider, lines] of renderLists(segments, theme)) {
 			const key = `${KEY_PREFIX}${provider}`;
 			keys.add(key);
 			ctx.ui.setWidget(key, lines, { placement: "aboveEditor" });

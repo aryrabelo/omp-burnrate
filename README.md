@@ -53,13 +53,16 @@ elapsed (ratio ~4.6).
 - 🟡 yellow — pace ratio > 1.1 up to 1.3.
 - 🟢 green — pace ratio ≤ 1.1 (inside the ±10% tolerance band, or under pace).
 
-**Display rules:** the long window is the headline. Week-scale-or-longer
-buckets (7 Day, Monthly, ...) always show and render **bold**. On-pace (🟢)
-*short*-window buckets — anything under a day, e.g. a healthy 5-hour quota —
-are hidden entirely: while a short window is inside its tolerance band it's
-noise, and it reappears the moment it burns past pace (🟡/🔴). An account
-whose only live bucket is a healthy short window stays out of the list until
-something is actually off.
+**Display rules:** the long window is the headline. Aggregate week-scale-or-longer
+caps (7 Day, Monthly, ... — the account's own cap, not per-product sub-caps
+like Fable or Zread) always show and render in the theme's **accent color**
+over bold. On-pace (🟢) *short*-window buckets — anything under a day, e.g. a
+healthy 5-hour quota — are hidden entirely: while a short window is inside its
+tolerance band it's noise, and it reappears the moment it burns past pace
+(🟡/🔴). An account whose only live bucket is a healthy short window stays out
+of the list until something is actually off. Over-quota rows (🔴, past the
+band) render in the theme's **error color** — red font, so trouble is legible
+at a glance even among highlighted rows.
 
 **Accounts can be hidden** — `HIDDEN_ACCOUNTS` in `src/main.ts` drops
 permanently-capped or uninteresting accounts (`manager` by default) by short

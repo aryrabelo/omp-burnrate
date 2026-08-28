@@ -15,6 +15,9 @@ export interface QuotaRow {
 	windowLabel: string | null;
 	usedFraction: number | null;
 	resetsAt: number | null;
+	/** True when the CLI marks this limit as a per-product sub-cap (`scope.tier` set, or
+	 * `scope.shared === false`) rather than the account's aggregate cap (Fable, Zread). */
+	subCap: boolean;
 	recordedAt: number;
 }
 
@@ -22,6 +25,7 @@ interface UsageLimit {
 	label: string;
 	window?: { label?: string | null; resetsAt?: number | null };
 	amount?: { usedFraction?: number | null };
+	scope?: { shared?: boolean; tier?: string };
 }
 
 interface UsageReport {
@@ -49,6 +53,7 @@ function reportRows(report: UsageReport, ordinal: number): QuotaRow[] {
 		windowLabel: limit.window?.label ?? null,
 		usedFraction: limit.amount?.usedFraction ?? null,
 		resetsAt: limit.window?.resetsAt ?? null,
+		subCap: limit.scope !== undefined && (limit.scope.tier !== undefined || limit.scope.shared === false),
 		recordedAt: report.fetchedAt,
 	}));
 }

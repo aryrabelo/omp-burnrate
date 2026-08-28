@@ -21,7 +21,8 @@ const WEEK_MS: number = 7 * DAY_MS;
 const MONTH_MS: number = 30 * DAY_MS;
 
 /** Leading-integer-plus-unit parser for free-text window labels ("7 Day", "5 Hour", "Weekly", "Monthly"). */
-const WINDOW_UNIT_RE = /^(\d+)?\s*(hour|hr|h|day|d|week|weekly|month|monthly)s?\b/;
+const WINDOW_UNIT_RE =
+	/^(\d+)?\s*(hour|hr|h|day|d|week|weekly|month|monthly)s?\b/;
 
 /**
  * Known non-standard labels that carry no parseable digit+unit (ported from MegaAgentOs's
@@ -37,7 +38,9 @@ const WINDOW_ALIASES: Record<string, number> = {
  * known alias nor a leading integer+unit token can be parsed — callers must skip the expected
  * baseline then.
  */
-export function parseWindowMs(windowLabel: string | null | undefined): number | null {
+export function parseWindowMs(
+	windowLabel: string | null | undefined,
+): number | null {
 	if (!windowLabel) return null;
 	const normalized = windowLabel.trim().toLowerCase();
 	const alias = WINDOW_ALIASES[normalized];
@@ -81,8 +84,18 @@ export interface Bucket {
  * see how far off an even pace ("ritmo") the account is, without the instability of forward
  * extrapolation.
  */
-export function buildBucket(usedPct: number, resetsAt: number | null, windowMs: number | null, now: number): Bucket {
-	if (resetsAt === null || windowMs === null || windowMs <= 0 || resetsAt <= now) {
+export function buildBucket(
+	usedPct: number,
+	resetsAt: number | null,
+	windowMs: number | null,
+	now: number,
+): Bucket {
+	if (
+		resetsAt === null ||
+		windowMs === null ||
+		windowMs <= 0 ||
+		resetsAt <= now
+	) {
 		return { usedPct, expectedPct: null, msUntilReset: 0, windowMs: null };
 	}
 	const msUntilReset = resetsAt - now;
@@ -135,10 +148,13 @@ export interface AccountGroup {
 export function groupByAccount(rows: QuotaRow[]): AccountGroup[] {
 	const groups = new Map<string, AccountGroup>();
 	for (const row of rows) {
-		const key = row.accountId ?? row.email ?? `${row.provider}:${row.accountKey}`;
+		const key =
+			row.accountId ?? row.email ?? `${row.provider}:${row.accountKey}`;
 		let group = groups.get(key);
 		if (!group) {
-			const shortLabel = (row.email ? (row.email.split("@")[0] ?? row.email) : row.provider).slice(0, 10);
+			const shortLabel = (
+				row.email ? (row.email.split("@")[0] ?? row.email) : row.provider
+			).slice(0, 10);
 			group = { key, shortLabel, provider: row.provider, rows: [] };
 			groups.set(key, group);
 		}
@@ -174,6 +190,8 @@ interface LiveBucket {
 	usedPct: number;
 	expectedPct: number;
 	ratio: number;
+	/** The row's `subCap` — false marks the account's aggregate cap (the headline quota). */
+	subCap: boolean;
 }
 
 /** Live (non-dead/unknown) buckets for one account's rows, shortest window first. */
@@ -182,7 +200,12 @@ function collectLiveBuckets(group: AccountGroup, now: number): LiveBucket[] {
 	for (const row of group.rows) {
 		if (row.usedFraction === null) continue;
 		const windowMs = parseWindowMs(row.windowLabel);
-		const bucket = buildBucket(row.usedFraction * 100, row.resetsAt, windowMs, now);
+		const bucket = buildBucket(
+			row.usedFraction * 100,
+			row.resetsAt,
+			windowMs,
+			now,
+		);
 		if (bucket.expectedPct === null || windowMs === null) continue;
 		live.push({
 			windowMs,
@@ -190,6 +213,7 @@ function collectLiveBuckets(group: AccountGroup, now: number): LiveBucket[] {
 			usedPct: bucket.usedPct,
 			expectedPct: bucket.expectedPct,
 			ratio: paceRatio(bucket.usedPct, bucket.expectedPct),
+			subCap: row.subCap,
 		});
 	}
 	live.sort((a, b) => a.windowMs - b.windowMs);
@@ -206,13 +230,17 @@ function collectLiveBuckets(group: AccountGroup, now: number): LiveBucket[] {
  * Two display rules live here so callers stay dumb:
  * - On-pace (green) hour-scale buckets (< 1 day) are dropped — a healthy short window is noise,
  *   the long window is the headline. Off-pace short windows still show.
- * - Week-scale-or-longer buckets carry `highlight: true` — renderers emphasize the weekly bar.
+ * - Week-scale-or-longer aggregate caps (non-sub-cap rows — per-product caps like Fable/Zread
+ *   are `subCap: true`) carry `highlight: true` — renderers emphasize the weekly bar.
  *
  * Segments are sorted by worst (highest) pace ratio across their surviving buckets — the
  * account with the hottest single bucket leads. `[]` when there is no quota data to show at
  * all. Framework-free by design: callers own rendering/color (see main.ts).
  */
-export function buildStatusSegments(rows: QuotaRow[], now: number = Date.now()): StatusSegment[] {
+export function buildStatusSegments(
+	rows: QuotaRow[],
+	now: number = Date.now(),
+): StatusSegment[] {
 	const scored: { segment: StatusSegment; worstRatio: number }[] = [];
 	for (const group of groupByAccount(rows)) {
 		const live = collectLiveBuckets(group, now).filter(
@@ -224,10 +252,13 @@ export function buildStatusSegments(rows: QuotaRow[], now: number = Date.now()):
 			used: Math.round(b.usedPct),
 			expected: Math.round(b.expectedPct),
 			severity: severityFromRatio(b.ratio),
-			highlight: b.windowMs >= WEEK_MS,
+			highlight: b.windowMs >= WEEK_MS && !b.subCap,
 		}));
 		const worstRatio = Math.max(...live.map((b) => b.ratio));
-		scored.push({ segment: { label: group.shortLabel, provider: group.provider, buckets }, worstRatio });
+		scored.push({
+			segment: { label: group.shortLabel, provider: group.provider, buckets },
+			worstRatio,
+		});
 	}
 	scored.sort((a, b) => b.worstRatio - a.worstRatio);
 	return scored.map((s) => s.segment);

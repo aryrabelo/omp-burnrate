@@ -6,15 +6,20 @@ const HOUR_MS: number = 60 * 60 * 1000;
 const DAY_MS: number = 24 * HOUR_MS;
 
 function row(overrides: Partial<QuotaRow> & Pick<QuotaRow, "provider" | "accountKey" | "label">): QuotaRow {
-	return {
-		email: null,
-		accountId: null,
-		windowLabel: null,
-		usedFraction: 0.5,
-		resetsAt: null,
-		recordedAt: 1,
-		...overrides,
-	};
+	// Object.assign, not a spread literal: spreading a Partial leaves `T | undefined` per key,
+	// which fails the QuotaRow return type.
+	return Object.assign(
+		{
+			email: null,
+			accountId: null,
+			windowLabel: null,
+			usedFraction: 0.5,
+			resetsAt: null,
+			subCap: false,
+			recordedAt: 1,
+		},
+		overrides,
+	);
 }
 
 describe("parseWindowMs", () => {
@@ -316,6 +321,19 @@ describe("buildStatusSegments display rules", () => {
 		const weekly = row({ provider: "anthropic", accountKey: "a", email: "a@x.io", label: "Claude 7 Day", windowLabel: "7 Day", usedFraction: 0.3, resetsAt: now + 3.5 * DAY_MS });
 		expect(buildStatusSegments([weekly], now)[0]?.buckets).toEqual([
 			{ label: "Claude 7 Day", used: 30, expected: 50, severity: "green", highlight: true },
+		]);
+	});
+
+	test("week-scale highlight only marks aggregate caps (subCap false), not per-product sub-caps", () => {
+		const now = 1_000_000;
+		const weekly = (subCap: boolean, label: string): QuotaRow =>
+			row({ provider: "anthropic", accountKey: "a", email: "a@x.io", label, windowLabel: "7 Day", usedFraction: 0.3, resetsAt: now + 3.5 * DAY_MS, subCap });
+		// Aggregate cap (subCap: false) is the headline; the per-model sub-cap (Fable) shows
+		// but stays plain.
+		const segments = buildStatusSegments([weekly(false, "Claude 7 Day"), weekly(true, "Claude 7 Day (Fable)")], now);
+		expect(segments[0]?.buckets).toEqual([
+			{ label: "Claude 7 Day", used: 30, expected: 50, severity: "green", highlight: true },
+			{ label: "Claude 7 Day (Fable)", used: 30, expected: 50, severity: "green", highlight: false },
 		]);
 	});
 });
