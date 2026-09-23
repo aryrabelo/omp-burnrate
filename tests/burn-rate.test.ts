@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { buildBucket, buildStatusSegments, groupByAccount, paceRatio, parseWindowMs, severityFromRatio } from "../src/burn-rate";
+import { buildBucket, buildStatusSegments, groupByAccount, overPace, parseWindowMs, severityFromOverPace } from "../src/burn-rate";
 import type { QuotaRow } from "../src/quota-source";
 
 const HOUR_MS: number = 60 * 60 * 1000;
@@ -87,37 +87,35 @@ describe("buildBucket", () => {
 	});
 });
 
-describe("paceRatio", () => {
-	test("used/expected when expected is positive", () => {
-		expect(paceRatio(70, 100)).toBeCloseTo(0.7, 5);
-		expect(paceRatio(130, 100)).toBeCloseTo(1.3, 5);
+describe("overPace", () => {
+	test("percentage points ahead of (positive) or behind (negative) the ideal point", () => {
+		expect(overPace(18, 11)).toBe(7);
+		expect(overPace(30, 50)).toBe(-20);
 	});
 
-	test("positive infinity when expected is zero and something was used (max over pace)", () => {
-		expect(paceRatio(5, 0)).toBe(Number.POSITIVE_INFINITY);
+	test("does not blow up at the start of a window, where a ratio would divide by ~0", () => {
+		expect(overPace(5, 0)).toBe(5);
 	});
 
-	test("zero when expected is zero and nothing was used (trivially on pace)", () => {
-		expect(paceRatio(0, 0)).toBe(0);
+	test("an exhausted bucket outranks any live gap, whatever the clock says", () => {
+		expect(overPace(100, 91)).toBe(Number.POSITIVE_INFINITY);
 	});
 });
 
-describe("severityFromRatio", () => {
-	test("green inside the +/-10% tolerance band around the ideal point", () => {
-		expect(severityFromRatio(0)).toBe("green");
-		expect(severityFromRatio(0.7)).toBe("green");
-		expect(severityFromRatio(1.0)).toBe("green");
-		expect(severityFromRatio(1.1)).toBe("green");
+describe("severityFromOverPace", () => {
+	test("green up to +10 points — inside the bar's markers", () => {
+		expect(severityFromOverPace(-40)).toBe("green");
+		expect(severityFromOverPace(10)).toBe("green");
 	});
 
-	test("yellow past the band, up to and including 1.3", () => {
-		expect(severityFromRatio(1.11)).toBe("yellow");
-		expect(severityFromRatio(1.3)).toBe("yellow");
+	test("yellow past +10, up to and including +20", () => {
+		expect(severityFromOverPace(10.5)).toBe("yellow");
+		expect(severityFromOverPace(20)).toBe("yellow");
 	});
 
-	test("red past 1.3", () => {
-		expect(severityFromRatio(1.31)).toBe("red");
-		expect(severityFromRatio(4.6)).toBe("red");
+	test("red past +20 and when exhausted", () => {
+		expect(severityFromOverPace(20.5)).toBe("red");
+		expect(severityFromOverPace(Number.POSITIVE_INFINITY)).toBe("red");
 	});
 });
 
@@ -197,6 +195,19 @@ describe("groupByAccount", () => {
 		const longProvider = [row({ provider: "a-very-long-provider-name", accountKey: "k", label: "L" })];
 		expect(groupByAccount(longProvider)[0]?.shortLabel).toHaveLength(10);
 	});
+
+	test("relabels a lone provider's role-inbox account with the provider's friendly name", () => {
+		const codex = [
+			row({ provider: "openai-codex", accountKey: "oauth", accountId: "cx", email: "manager@borabot.com.br", label: "7 days", windowLabel: "7 days", usedFraction: 0.3 }),
+		];
+		expect(groupByAccount(codex)[0]?.shortLabel).toBe("codex");
+	});
+
+	test("keeps a role-inbox local part when its provider has more than one account", () => {
+		// `admin@duaud.io` is one of three anthropic accounts, so `admin` still distinguishes it.
+		const groups = groupByAccount(rows);
+		expect(groups.find((g) => g.key === "account:ccc")?.shortLabel).toBe("admin");
+	});
 });
 
 describe("buildStatusSegments", () => {
@@ -209,9 +220,9 @@ describe("buildStatusSegments", () => {
 		expect(buildStatusSegments(rows, 1_000_000)).toEqual([]);
 	});
 
-	test("one live bucket: severity from pace ratio, expected pct from elapsed window", () => {
+	test("one live bucket: severity from points over pace, expected pct from elapsed window", () => {
 		const now = 1_000_000;
-		// 10h window, 5h elapsed (50% expected), 60% used → ratio 1.2 → yellow. (A green
+		// 10h window, 5h elapsed (50% expected), 65% used → +15 points → yellow. (A green
 		// hour-scale bucket would be hidden entirely — see the display-rule tests below.)
 		const rows: QuotaRow[] = [
 			row({
@@ -221,13 +232,13 @@ describe("buildStatusSegments", () => {
 				email: "aryrabelo@gmail.com",
 				label: "Claude 10 Hour",
 				windowLabel: "10 Hour",
-				usedFraction: 0.6,
+				usedFraction: 0.65,
 				resetsAt: now + 5 * HOUR_MS,
 			}),
 		];
 		const segments = buildStatusSegments(rows, now);
 		expect(segments).toEqual([
-			{ label: "aryrabelo", provider: "anthropic", buckets: [{ label: "Claude 10 Hour", used: 60, expected: 50, severity: "yellow", highlight: false }] },
+			{ label: "aryrabelo", provider: "anthropic", buckets: [{ label: "Claude 10 Hour", used: 65, expected: 50, severity: "yellow", highlight: false, resetsAt: now + 5 * HOUR_MS }] },
 		]);
 	});
 
@@ -255,46 +266,31 @@ describe("buildStatusSegments", () => {
 		expect(segments[0]?.buckets.map((b) => b.label)).toEqual(["Claude 5 Hour", "Claude 7 Day", "Claude 7 Day (Fable)", "Claude 30 Day"]);
 	});
 
-	test("real scenario: a healthy 5h bucket is hidden; the over-pace weekly bucket shows, highlighted", () => {
+	test("real scenario (2026-09-23): early-window lead with margin is green; exhausted quota is red", () => {
 		const now = 1_000_000;
-		// 5h bucket: 63% used, 90% of window elapsed → ratio 0.7 → green → dropped (display rule).
-		// Weekly bucket: 13% used, only ~2.8% of window elapsed → ratio ~4.6 → red, highlighted.
 		const rows: QuotaRow[] = [
-			row({
-				provider: "anthropic",
-				accountKey: "oauth",
-				accountId: "a",
-				email: "fiamclaude@duaud.io",
-				label: "Claude 5 Hour",
-				windowLabel: "5 Hour",
-				usedFraction: 0.63,
-				resetsAt: now + 0.5 * HOUR_MS,
-			}),
-			row({
-				provider: "anthropic",
-				accountKey: "oauth",
-				accountId: "a",
-				email: "fiamclaude@duaud.io",
-				label: "Claude 7 Day",
-				windowLabel: "7 Day",
-				usedFraction: 0.13,
-				resetsAt: now + 163.3 * HOUR_MS,
-			}),
+			// 5h bucket, 63% used at 90% elapsed → under pace → dropped (display rule).
+			row({ provider: "anthropic", accountKey: "f", accountId: "f", email: "fiamclaude@duaud.io", label: "Claude 5 Hour", windowLabel: "5 Hour", usedFraction: 0.63, resetsAt: now + 0.5 * HOUR_MS }),
+			// 18% used, ~11% elapsed: 82% left for 6 days. The old ratio (1.6×) painted this red.
+			row({ provider: "anthropic", accountKey: "f", accountId: "f", email: "fiamclaude@duaud.io", label: "Claude 7 Day", windowLabel: "7 Day", usedFraction: 0.18, resetsAt: now + 149.5 * HOUR_MS }),
+			// 100% used, ~91% elapsed: blocked until reset. The old ratio (1.099×) painted this green.
+			row({ provider: "anthropic", accountKey: "a", accountId: "a", email: "aryrabelo@gmail.com", label: "Claude 7 Day", windowLabel: "7 Day", usedFraction: 1, resetsAt: now + 15 * HOUR_MS }),
 		];
 		const segments = buildStatusSegments(rows, now);
-		expect(segments[0]?.buckets).toEqual([
-			{ label: "Claude 7 Day", used: 13, expected: 3, severity: "red", highlight: true },
+		expect(segments.map((s) => [s.label, s.buckets.map((b) => [b.label, b.severity])])).toEqual([
+			["aryrabelo", [["Claude 7 Day", "red"]]],
+			["fiamclaude", [["Claude 7 Day", "green"]]],
 		]);
 	});
 
-	test("sorts accounts by worst pace ratio across their buckets, descending", () => {
+	test("sorts accounts by worst points-over-pace across their buckets, descending", () => {
 		const now = 1_000_000;
 		const rows: QuotaRow[] = [
-			// A: 60% used, 50% elapsed → ratio 1.2, yellow (a green hour bucket would be hidden).
-			row({ provider: "p", accountKey: "A", accountId: "a", email: "A@x.io", label: "L", windowLabel: "10 Hour", usedFraction: 0.6, resetsAt: now + 5 * HOUR_MS }),
-			// B: 90% used, 50% elapsed → ratio 1.8, red.
+			// A: 62% used, 50% elapsed → +12, yellow (a green hour bucket would be hidden).
+			row({ provider: "p", accountKey: "A", accountId: "a", email: "A@x.io", label: "L", windowLabel: "10 Hour", usedFraction: 0.62, resetsAt: now + 5 * HOUR_MS }),
+			// B: 90% used, 50% elapsed → +40, red.
 			row({ provider: "p", accountKey: "B", accountId: "b", email: "B@x.io", label: "L", windowLabel: "10 Hour", usedFraction: 0.9, resetsAt: now + 5 * HOUR_MS }),
-			// C: 70% used, 50% elapsed → ratio 1.4, yellow.
+			// C: 70% used, 50% elapsed → +20, yellow.
 			row({ provider: "p", accountKey: "C", accountId: "c", email: "C@x.io", label: "L", windowLabel: "10 Hour", usedFraction: 0.7, resetsAt: now + 5 * HOUR_MS }),
 		];
 		const labels = buildStatusSegments(rows, now).map((s) => s.label);
@@ -305,13 +301,13 @@ describe("buildStatusSegments", () => {
 describe("buildStatusSegments display rules", () => {
 	test("on-pace hour-scale bucket is hidden; off-pace one still shows", () => {
 		const now = 1_000_000;
-		// 5h window, 20% elapsed → ideal 20%. 10% used → ratio 0.5 → green → dropped.
+		// 5h window, 20% elapsed → ideal 20%. 10% used → under pace → green → dropped.
 		const healthy = row({ provider: "zai", accountKey: "z1", label: "5 Hours Token Quota", windowLabel: "5 Hour", usedFraction: 0.1, resetsAt: now + 4 * HOUR_MS });
 		expect(buildStatusSegments([healthy], now)).toEqual([]);
-		// Same window, 40% used → ratio 2.0 → red → shown, not highlighted.
-		const burning = { ...healthy, usedFraction: 0.4 };
+		// Same window, 45% used → +25 points → red → shown, not highlighted.
+		const burning = { ...healthy, usedFraction: 0.45 };
 		expect(buildStatusSegments([burning], now)[0]?.buckets).toEqual([
-			{ label: "5 Hours Token Quota", used: 40, expected: 20, severity: "red", highlight: false },
+			{ label: "5 Hours Token Quota", used: 45, expected: 20, severity: "red", highlight: false, resetsAt: now + 4 * HOUR_MS },
 		]);
 	});
 
@@ -320,7 +316,7 @@ describe("buildStatusSegments display rules", () => {
 		// 7d window, half elapsed → ideal 50%. 30% used → ratio 0.6 → green, yet headline.
 		const weekly = row({ provider: "anthropic", accountKey: "a", email: "a@x.io", label: "Claude 7 Day", windowLabel: "7 Day", usedFraction: 0.3, resetsAt: now + 3.5 * DAY_MS });
 		expect(buildStatusSegments([weekly], now)[0]?.buckets).toEqual([
-			{ label: "Claude 7 Day", used: 30, expected: 50, severity: "green", highlight: true },
+			{ label: "Claude 7 Day", used: 30, expected: 50, severity: "green", highlight: true, resetsAt: now + 3.5 * DAY_MS },
 		]);
 	});
 
@@ -332,8 +328,20 @@ describe("buildStatusSegments display rules", () => {
 		// but stays plain.
 		const segments = buildStatusSegments([weekly(false, "Claude 7 Day"), weekly(true, "Claude 7 Day (Fable)")], now);
 		expect(segments[0]?.buckets).toEqual([
-			{ label: "Claude 7 Day", used: 30, expected: 50, severity: "green", highlight: true },
-			{ label: "Claude 7 Day (Fable)", used: 30, expected: 50, severity: "green", highlight: false },
+			{ label: "Claude 7 Day", used: 30, expected: 50, severity: "green", highlight: true, resetsAt: now + 3.5 * DAY_MS },
+			{ label: "Claude 7 Day (Fable)", used: 30, expected: 50, severity: "green", highlight: false, resetsAt: now + 3.5 * DAY_MS },
 		]);
+	});
+
+	test("propagates the exact source resetsAt onto every visible bucket, including a zero timestamp", () => {
+		// `now` sits just before the epoch instant so a resetsAt of 0 is still a future,
+		// non-stale window and survives into a live bucket.
+		const now = -HOUR_MS;
+		const rows: QuotaRow[] = [
+			row({ provider: "anthropic", accountKey: "oauth", accountId: "a", email: "a@x.io", label: "Claude 7 Day", windowLabel: "7 Day", usedFraction: 0.3, resetsAt: 0 }),
+		];
+		const segments = buildStatusSegments(rows, now);
+		// A dropped/coerced timestamp would surface as null (the row helper's default), not 0.
+		expect(segments[0]?.buckets[0]?.resetsAt).toBe(0);
 	});
 });

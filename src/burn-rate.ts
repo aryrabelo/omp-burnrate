@@ -4,9 +4,10 @@
  *
  * Expected-usage idea (ported from MegaAgentOs's `expectedFraction`/burn-rate ring,
  * public/js/main.js): compare current usage against a linear, time-proportional baseline
- * instead of extrapolating pace forward. `usedPct / expectedPct` ("ritmo"/pace ratio) is
- * stable through the whole window — unlike a forward ratio projection, it can't explode right
- * after a reset, because the denominator only ever shrinks toward 100, never toward 0.
+ * instead of extrapolating pace forward. The verdict is the gap `usedPct - expectedPct` in
+ * percentage points — the same quantity the bar draws (fill vs. the ±10-point markers). A ratio
+ * (`used / expected`) was used before and blew up early in a window: 18% used at 11% elapsed
+ * read 1.6× → red on an account with 82% left, while the bar showed it on pace.
  *
  * An account can carry several independent quota buckets at once (a 5-hour window, an overall
  * weekly cap, a per-model weekly sub-cap, ...). Collapsing that down to one "most urgent"
@@ -106,42 +107,69 @@ export function buildBucket(
 
 export type Severity = "green" | "yellow" | "red";
 
-/**
- * Pace-ratio band ("ritmo"): a +/-10% tolerance around the ideal point. At or under +10% is on
- * pace, up to +30% is drifting, past that is alarming. The -10% edge needs no threshold —
- * burning slower than ideal is never a warning.
- */
-const PACE_YELLOW = 1.1;
-const PACE_RED = 1.3;
+/** Percentage-point band around the ideal point — the same half-width main.ts draws as the
+ * bar's `|` markers. Within +10 points is on pace, up to +20 is drifting, past that is alarming.
+ * Burning slower than ideal is never a warning. */
+const OVER_YELLOW = 10;
+const OVER_RED = 20;
 
 /**
- * `usedPct / expectedPct` — how many times faster than an even pace this bucket is burning.
- * 0.7 reads "burning at 70% of the expected pace" (plenty of room); 1.3 reads "30% hotter than
- * expected". `expectedPct <= 0` (right at/before a reset) is a division-by-zero edge case,
- * resolved directly: any usage at all is maximally over pace, none is trivially on pace.
+ * Urgency of one bucket: how many percentage points usage runs ahead of an even pace.
+ * An exhausted bucket (>= 100% used) has no margin left at all, whatever the clock says, so it
+ * ranks above any live gap.
  */
-export function paceRatio(usedPct: number, expectedPct: number): number {
-	if (expectedPct <= 0) return usedPct > 0 ? Number.POSITIVE_INFINITY : 0;
-	return usedPct / expectedPct;
+export function overPace(usedPct: number, expectedPct: number): number {
+	if (usedPct >= 100) return Number.POSITIVE_INFINITY;
+	return usedPct - expectedPct;
 }
 
-/** `red` — pace ratio past `PACE_RED`; `yellow` — past `PACE_YELLOW` but not `PACE_RED`; `green` — at or under pace. */
-export function severityFromRatio(ratio: number): Severity {
-	if (ratio > PACE_RED) return "red";
-	if (ratio > PACE_YELLOW) return "yellow";
+/** `red` — exhausted or more than `OVER_RED` points ahead; `yellow` — more than `OVER_YELLOW`;
+ * `green` — inside the bar's tolerance band or under pace. */
+export function severityFromOverPace(over: number): Severity {
+	if (over > OVER_RED) return "red";
+	if (over > OVER_YELLOW) return "yellow";
 	return "green";
 }
 
 export interface AccountGroup {
 	/** Grouping identity: `accountId` when present, else `email`, else `provider:accountKey`. */
 	key: string;
-	/** Local part of the email before `@`, else the provider name — truncated to 10 chars. */
+	/** Display name: the email local part (what distinguishes accounts of one provider), else the
+	 * provider name. A role-inbox local part (`manager@…`) on a provider with a single account is
+	 * swapped for the provider's own friendly name — `codex`, not `manager`. Truncated to 10. */
 	shortLabel: string;
 	/** Which provider this account belongs to (`anthropic`, `openai-codex`, `kimi-code`, `zai`,
 	 * ...) — accounts named after a person/role (`manager`, `admin`) don't disclose this on
 	 * their own, so callers need it to render a provider icon. */
 	provider: string;
 	rows: QuotaRow[];
+}
+
+/** Role-inbox local parts that name a mailbox, not a person — useless as an account label when
+ * the provider has just one account (openai-codex logs in as `manager@borabot`). */
+const GENERIC_LOCAL_PARTS: Record<string, true> = {
+	manager: true,
+	admin: true,
+	root: true,
+	owner: true,
+	billing: true,
+	support: true,
+	account: true,
+	user: true,
+	bot: true,
+};
+
+/** Friendly provider names for the rare account whose own email says nothing. Only consulted in
+ * the generic-inbox fallback below, so providers with meaningful emails are untouched. */
+const PROVIDER_LABELS: Record<string, string> = {
+	"openai-codex": "codex",
+	"kimi-code": "kimi",
+	anthropic: "claude",
+};
+
+function localPart(email: string | null): string | null {
+	if (!email) return null;
+	return email.split("@")[0] ?? email;
 }
 
 /** Groups rows by distinct account so each account's own quota is visible, not just an aggregate. */
@@ -152,13 +180,31 @@ export function groupByAccount(rows: QuotaRow[]): AccountGroup[] {
 			row.accountId ?? row.email ?? `${row.provider}:${row.accountKey}`;
 		let group = groups.get(key);
 		if (!group) {
-			const shortLabel = (
-				row.email ? (row.email.split("@")[0] ?? row.email) : row.provider
-			).slice(0, 10);
-			group = { key, shortLabel, provider: row.provider, rows: [] };
+			const base = localPart(row.email) ?? row.provider;
+			group = {
+				key,
+				shortLabel: base.slice(0, 10),
+				provider: row.provider,
+				rows: [],
+			};
 			groups.set(key, group);
 		}
 		group.rows.push(row);
+	}
+	// A role-inbox label (manager@…) reads better as the provider's own name — but only when that
+	// provider has a single account, so a provider with several keeps the distinguishing local part.
+	const perProvider = new Map<string, number>();
+	for (const g of groups.values())
+		perProvider.set(g.provider, (perProvider.get(g.provider) ?? 0) + 1);
+	for (const g of groups.values()) {
+		const lp = localPart(g.rows[0]?.email ?? null);
+		if (
+			lp &&
+			GENERIC_LOCAL_PARTS[lp.toLowerCase()] &&
+			perProvider.get(g.provider) === 1
+		) {
+			g.shortLabel = (PROVIDER_LABELS[g.provider] ?? g.provider).slice(0, 10);
+		}
 	}
 	return [...groups.values()];
 }
@@ -173,6 +219,9 @@ export interface QuotaBucketView {
 	severity: Severity;
 	/** Week-scale-or-longer window (the slow quota that matters most) — renderers emphasize it. */
 	highlight: boolean;
+	/** Epoch ms this bucket's window resets, propagated verbatim from the source row; `null`
+	 * when the source supplied none. */
+	resetsAt: number | null;
 }
 
 export interface StatusSegment {
@@ -189,9 +238,12 @@ interface LiveBucket {
 	label: string;
 	usedPct: number;
 	expectedPct: number;
-	ratio: number;
+	/** `overPace` — points ahead of an even pace (`+Infinity` when exhausted). */
+	over: number;
 	/** The row's `subCap` — false marks the account's aggregate cap (the headline quota). */
 	subCap: boolean;
+	/** The row's `resetsAt`, carried through untouched for renderers. */
+	resetsAt: number | null;
 }
 
 /** Live (non-dead/unknown) buckets for one account's rows, shortest window first. */
@@ -212,8 +264,9 @@ function collectLiveBuckets(group: AccountGroup, now: number): LiveBucket[] {
 			label: row.label,
 			usedPct: bucket.usedPct,
 			expectedPct: bucket.expectedPct,
-			ratio: paceRatio(bucket.usedPct, bucket.expectedPct),
+			over: overPace(bucket.usedPct, bucket.expectedPct),
 			subCap: row.subCap,
+			resetsAt: row.resetsAt,
 		});
 	}
 	live.sort((a, b) => a.windowMs - b.windowMs);
@@ -223,9 +276,9 @@ function collectLiveBuckets(group: AccountGroup, now: number): LiveBucket[] {
 /**
  * Full pipeline: quota rows → one segment per distinct account, each carrying every live quota
  * bucket for that account (an account can have several at once — 5h, weekly, a per-model
- * weekly sub-cap). Each bucket is colored by pace ratio, not raw percentage, so a heavily-used
- * but genuinely on-pace bucket doesn't read as alarming next to a lightly-used bucket burning
- * far ahead of pace.
+ * weekly sub-cap). Each bucket is colored by how far usage runs ahead of an even pace, in
+ * percentage points, so a heavily-used but on-pace bucket doesn't read as alarming, and an
+ * exhausted bucket never reads as healthy.
  *
  * Two display rules live here so callers stay dumb:
  * - On-pace (green) hour-scale buckets (< 1 day) are dropped — a healthy short window is noise,
@@ -233,7 +286,7 @@ function collectLiveBuckets(group: AccountGroup, now: number): LiveBucket[] {
  * - Week-scale-or-longer aggregate caps (non-sub-cap rows — per-product caps like Fable/Zread
  *   are `subCap: true`) carry `highlight: true` — renderers emphasize the weekly bar.
  *
- * Segments are sorted by worst (highest) pace ratio across their surviving buckets — the
+ * Segments are sorted by worst (highest) over-pace gap across their surviving buckets — the
  * account with the hottest single bucket leads. `[]` when there is no quota data to show at
  * all. Framework-free by design: callers own rendering/color (see main.ts).
  */
@@ -241,25 +294,26 @@ export function buildStatusSegments(
 	rows: QuotaRow[],
 	now: number = Date.now(),
 ): StatusSegment[] {
-	const scored: { segment: StatusSegment; worstRatio: number }[] = [];
+	const scored: { segment: StatusSegment; worstOver: number }[] = [];
 	for (const group of groupByAccount(rows)) {
 		const live = collectLiveBuckets(group, now).filter(
-			(b) => !(b.windowMs < DAY_MS && severityFromRatio(b.ratio) === "green"),
+			(b) => !(b.windowMs < DAY_MS && severityFromOverPace(b.over) === "green"),
 		);
 		if (live.length === 0) continue;
 		const buckets: QuotaBucketView[] = live.map((b) => ({
 			label: b.label,
 			used: Math.round(b.usedPct),
 			expected: Math.round(b.expectedPct),
-			severity: severityFromRatio(b.ratio),
+			severity: severityFromOverPace(b.over),
 			highlight: b.windowMs >= WEEK_MS && !b.subCap,
+			resetsAt: b.resetsAt,
 		}));
-		const worstRatio = Math.max(...live.map((b) => b.ratio));
+		const worstOver = Math.max(...live.map((b) => b.over));
 		scored.push({
 			segment: { label: group.shortLabel, provider: group.provider, buckets },
-			worstRatio,
+			worstOver,
 		});
 	}
-	scored.sort((a, b) => b.worstRatio - a.worstRatio);
+	scored.sort((a, b) => b.worstOver - a.worstOver);
 	return scored.map((s) => s.segment);
 }

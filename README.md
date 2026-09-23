@@ -17,41 +17,54 @@ one line per account bucket — carrying **every live quota bucket that account
 has at once** (a 5-hour window, an overall weekly cap, a per-model weekly
 sub-cap, ...). Collapsing an account down to a single "most urgent" number
 hides whichever bucket didn't win — e.g. a healthy 5-hour bucket can outrank
-(by raw usedPct) a weekly bucket that's actually burning 4-5x faster than
-pace, because the weekly one is numerically smaller this early in its window.
+(by raw usedPct) a weekly bucket that's actually running well ahead of pace.
 
 ```
-🔴 🟧aryrabelo  Claude 7 Day            ████████|█████|█░░░░░░░░░░░░░░ 50% used · ideal 37%
-🔴 🟧aryrabelo  Claude 7 Day (Fable)    ████████|█████|████░░░░░░░░░░░ 59% used · ideal 37%
-🟡 🟧fiamclaude Claude 7 Day            █████████████|██████|░░░░░░░░░ 68% used · ideal 57%
-🟡 🟧fiamclaude Claude 7 Day (Fable)    █████████████|██████|░░░░░░░░░ 68% used · ideal 57%
+🟡 🟧aryrabelo  Claude 7 Day            ████████|█████|█░░░░░░░░░░░░░░ 50% used · ideal 37% · reset 16 Sep, 22:59
+🔴 🟧aryrabelo  Claude 7 Day (Fable)    ████████|█████|████░░░░░░░░░░░ 59% used · ideal 37% · reset 16 Sep, 22:59
+🟡 🟧fiamclaude Claude 7 Day            █████████████|██████|░░░░░░░░░ 68% used · ideal 57% · reset 22 Sep, 14:00
+🟡 🟧fiamclaude Claude 7 Day (Fable)    █████████████|██████|░░░░░░░░░ 68% used · ideal 57% · reset 22 Sep, 13:59
 ```
 
 (In the terminal these rows render **bold** — see the display rules below.)
 
-**The two `|` markers bracket the ideal point's ±10% tolerance band.** Fill
+**The two `|` markers bracket the ideal point's ±10-point tolerance band.** Fill
 ending left of the first marker is under pace, between them is on pace, past
 the second is over pace — the verdict is readable off the bar itself, and the
 leading dot just repeats it.
 
 **Provider icon** disambiguates accounts whose own name gives no hint —
 `fiamclaude`, `admin`, and `aryrabelo` all share 🟧 because they're Claude
-accounts, while a `manager` account would be `openai-codex` (✳️). Known
-providers (`anthropic`, `openai-codex`, `kimi-code`, `zai`) get a
-recognizable icon; an unrecognized provider falls back to its first letter
-circled (Ⓐ..Ⓩ) so it still gets a distinguishing, deterministic mark.
+accounts, while the ✳️ `codex` account is `openai-codex`. Known providers
+(`anthropic`, `openai-codex`, `kimi-code`, `zai`) get a recognizable icon; an
+unrecognized provider falls back to its first letter circled (Ⓐ..Ⓩ) so it
+still gets a distinguishing, deterministic mark.
 
-**Color is by pace ratio** (`usedPct / expectedPct` — "ritmo"), not raw
+**Account labels** come from the email local part (`fiamclaude`, `aryrabelo`),
+which is what tells same-provider accounts apart. When that local part is a
+role inbox (`manager@…`) and the provider has a single account, the label
+falls back to the provider's own name — so the lone Codex login reads `codex`,
+not `manager`. A provider with several accounts keeps the distinguishing local
+part (the three Claude accounts stay `fiamclaude`/`aryrabelo`/`admin`).
+
+**Color is by points over pace** (`usedPct - expectedPct`), not raw
 percentage: `expectedPct` is where usage would sit right now if it tracked
-the clock exactly (linear, not a forward projection — stable through the
-whole window instead of exploding right after a reset). A bucket at 100%
-used isn't necessarily red if its window is also almost over (ratio close to
-1); a bucket at 13% used can be deep red if only ~3% of its window has
-elapsed (ratio ~4.6).
+the clock exactly (linear, not a forward projection). It is the same gap the
+bar draws, so dot and bar never disagree. A ratio (`used / expected`) was used
+before and misread both ends of a window: 18% used at 11% elapsed read 1.6× →
+red on an account with 82% left, while 100% used at 91% elapsed read 1.099× →
+green on an account that was already blocked.
 
-- 🔴 red — pace ratio > 1.3 (burning noticeably faster than the clock).
-- 🟡 yellow — pace ratio > 1.1 up to 1.3.
-- 🟢 green — pace ratio ≤ 1.1 (inside the ±10% tolerance band, or under pace).
+- 🔴 red — more than 20 points ahead of the ideal, or the bucket is exhausted
+  (≥ 100% used — no margin left, whatever the clock says).
+- 🟡 yellow — more than 10 up to 20 points ahead.
+- 🟢 green — within 10 points of the ideal (inside the bar's markers), or under pace.
+
+**Each row ends with its window's reset instant** — `· reset 16 Sep, 22:59`,
+in your local timezone (24-hour). The widget is fetched once per session (no
+refresh timer), so it shows the absolute reset time rather than a live
+countdown that would drift stale as the session runs. Rows whose quota data
+carries no reset timestamp simply omit the suffix.
 
 **Display rules:** the long window is the headline. Aggregate week-scale-or-longer
 caps (7 Day, Monthly, ... — the account's own cap, not per-product sub-caps
@@ -64,11 +77,12 @@ of the list until something is actually off. Over-quota rows (🔴, past the
 band) render in the theme's **error color** — red font, so trouble is legible
 at a glance even among highlighted rows.
 
-**Accounts can be hidden** — `HIDDEN_ACCOUNTS` in `src/main.ts` drops
-permanently-capped or uninteresting accounts (`manager` by default) by short
-label.
+**Accounts can be hidden** — `HIDDEN_ACCOUNTS` in `src/main.ts` drops accounts
+by short label (email local part, else provider name). It's empty by default;
+add a short label there to suppress a permanently-capped or uninteresting
+account.
 
-**Segments are sorted by worst pace ratio** across their buckets, descending
+**Segments are sorted by worst points-over-pace** across their buckets, descending
 — the account with the single hottest bucket leads.
 
 Rendered as one widget **per provider**: the host truncates a single widget at

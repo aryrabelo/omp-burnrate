@@ -34,8 +34,9 @@ const SEVERITY_DOT: Record<Severity, string> = {
 };
 
 /** Accounts deliberately hidden: permanently-capped or otherwise uninteresting, matched on the
- * short label (email local part, else provider name). */
-const HIDDEN_ACCOUNTS: Record<string, true> = { manager: true };
+ * short label (email local part, else provider name). Empty now — the `manager` account it once
+ * hid is the live openai-codex quota (email `manager@…`), so hiding it dropped Codex entirely. */
+const HIDDEN_ACCOUNTS: Record<string, true> = {};
 
 /** Known-provider icons, so accounts sharing a provider are visually grouped even when their
  * own names (person/role) give no hint. Unknown providers fall back to a circled first letter
@@ -85,6 +86,19 @@ function renderBar(used: number, expected: number): string {
 	return cells.join("");
 }
 
+const RESET_MONTHS = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
+
+/** Render a reset timestamp in the operator's local timezone, omitting malformed metadata. */
+function formatResetAt(resetsAt: number | null): string {
+	if (resetsAt === null || !Number.isFinite(resetsAt)) return "";
+	const date = new Date(resetsAt);
+	if (!Number.isFinite(date.getTime())) return "";
+	const month = RESET_MONTHS[date.getMonth()];
+	if (month === undefined) return "";
+	const minute = String(date.getMinutes()).padStart(2, "0");
+	return ` · reset ${date.getDate()} ${month}, ${String(date.getHours()).padStart(2, "0")}:${minute}`;
+}
+
 /**
  * `dot account label bar used% · ideal N%` lines, grouped into one entry per provider (worst
  * pace first). Text columns are padded across ALL providers, so bars and markers stay aligned
@@ -99,7 +113,7 @@ function renderBucketLine(
 	labelWidth: number,
 	paint: (color: string, text: string) => string,
 ): string {
-	const line = `${SEVERITY_DOT[b.severity]} ${who} ${b.label.padEnd(labelWidth)} ${renderBar(b.used, b.expected)} ${b.used}% used · ideal ${b.expected}%`;
+	const line = `${SEVERITY_DOT[b.severity]} ${who} ${b.label.padEnd(labelWidth)} ${renderBar(b.used, b.expected)} ${b.used}% used · ideal ${b.expected}%${formatResetAt(b.resetsAt)}`;
 	if (b.severity === "red") return paint("error", line);
 	if (b.highlight) return paint("accent", BOLD_ON + line + BOLD_OFF);
 	return line;
